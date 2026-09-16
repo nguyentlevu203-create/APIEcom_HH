@@ -1,0 +1,45 @@
+# OS / editor junk
+.DS_Store
+**/.DS_Store
+
+# Python
+__pycache__/
+**/__pycache__/
+*.pyc
+.pytest_cache/
+**/.pytest_cache/
+.venv/
+venv/
+
+# Node / Cloudflare Workers
+node_modules/
+**/node_modules/
+.wrangler/
+**/.wrangler/
+worker-configuration.d.ts
+
+# Credentials / secrets — never commit live tokens or keys
+.env
+.env.*
+!.env.example
+.dev.vars
+tokens.json
+tokens*.json
+shop_info.json
+*.secret
+credentials*
+*.pem
+*.key
+
+# Raw API dumps and normalized pipeline output (contains live business/customer data)
+**/data/raw/
+**/pilot_reporting/raw/
+**/pilot_reporting/logs/
+**/pilot_reporting/normalized/
+**/pilot_reporting/reports/
+
+# Generated business reports / CEO deliverables (proprietary financial data)
+artifacts/
+exports/
+*.xlsx
+*.xls

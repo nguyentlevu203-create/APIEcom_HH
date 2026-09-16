@@ -1,0 +1,15 @@
+tokens.json
+tokens*.json
+shop_info.json
+.env
+.env.*
+!.env.example
+*.secret
+credentials*
+data/raw/
+pilot_reporting/raw/
+pilot_reporting/logs/
+pilot_reporting/normalized/
+__pycache__/
+*.pyc
+.venv/

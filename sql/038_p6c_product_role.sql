@@ -1,0 +1,22 @@
+-- =====================================================================
+-- 039_p6c_product_role.sql
+-- HH_ECOM_AI_PILOT / hh_ecom — P6C product transaction-role column.
+--
+-- P5A.3's 3-layer model deliberately keeps "role" (SALE/PROMO_GIFT/
+-- PACKAGING) separate from master_product_type (a permanent physical
+-- classification) because role can be channel-dependent (1 BÁNH-XP:
+-- PROMO_GIFT on Shopee, SALE on TikTok). Until now this default_role
+-- only ever lived in Python (_p5b_load.py's build_approved_master()),
+-- making it unreachable from plain SQL (e.g. mart.v_ai_product_daily,
+-- P6C). This column persists the exact same, already-HH-approved
+-- default_role — no new business decision, no re-derivation — so SQL
+-- views can classify sold vs gift units correctly.
+--
+-- Additive only. Channel-dependent overrides (the ONE case, 1 BÁNH-XP)
+-- are handled separately in application/view logic, not here — this
+-- column is the per-product DEFAULT only, exactly mirroring
+-- build_approved_master()'s own default_role/channel_role_override
+-- split.
+-- =====================================================================
+ALTER TABLE core.dim_product
+    ADD COLUMN IF NOT EXISTS default_transaction_role TEXT;

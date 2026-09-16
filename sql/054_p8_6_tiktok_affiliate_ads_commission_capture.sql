@@ -1,0 +1,21 @@
+-- =====================================================================
+-- 054_p8_6_tiktok_affiliate_ads_commission_capture.sql
+-- P8.6 — capture TikTok fee_tax_breakdown.fee.affiliate_ads_commission_amount,
+-- an already-authorized, already-called-endpoint field (finance_order_
+-- statement_transactions, same response core.fact_settlement_sku_fee
+-- already reads) that was silently dropped at ingest time. Live 20-order/
+-- 39-sku sample this pass: 6/39 nonzero, sum=-49,760 VND — a real,
+-- distinct cost, NOT a duplicate of the 5 already-mapped fee sub-fields
+-- (proven: sku.fee_tax_amount == sum of all 6 nonzero fee sub-fields
+-- including this one, to the VND).
+--
+-- CAPTURE ONLY. Per P8.6 Section G/I instruction: accounting role is not
+-- yet certain (affiliate_fee/affiliate_commission_amount already sits at
+-- CM2, not CM1, for TikTok — whether this "ads" variant belongs there,
+-- at CM1, or requires the still-blocked TikTok Ads Developer Profile
+-- context is undetermined). This migration adds the column and nothing
+-- else touches CM1/CM2/Gold/mart.v_ceo_ecom_daily. No existing column
+-- renamed or dropped. Additive only.
+-- =====================================================================
+ALTER TABLE core.fact_settlement_sku_fee
+    ADD COLUMN IF NOT EXISTS affiliate_ads_commission_amount NUMERIC(18,4);

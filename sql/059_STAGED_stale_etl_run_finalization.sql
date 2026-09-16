@@ -1,0 +1,58 @@
+-- =====================================================================
+-- 059_STAGED_stale_etl_run_finalization.sql
+-- STATUS: STAGED / NOT APPLIED — pending human approval.
+--
+-- Phase 8 — deterministic stale-run handling for control.etl_run_log.
+-- 5 rows currently sit in status='running', all >2 hours stale (oldest
+-- since 2026-09-14 03:41 UTC), from process crashes/kills that never
+-- reached a terminal status. Per instruction: do not simply delete
+-- them, and do not touch genuinely current/valid running jobs.
+--
+-- One-time remediation (this statement) — NOT executed this pass:
+-- =====================================================================
+-- UPDATE control.etl_run_log
+-- SET status = 'stale_abandoned',
+--     error_message = COALESCE(error_message, '') ||
+--         ' [auto-finalized: exceeded 2h running with no update, ' ||
+--         'process presumed crashed/killed; finalized ' || now()::text || ']'
+-- WHERE status = 'running' AND started_at < now() - interval '2 hours';
+
+-- =====================================================================
+-- Recurring safety (Phase 8's "startup/finalization safety" requirement)
+-- — a NEW cron-style check, run at the START of every production cycle
+-- (before any new domain runs), so a crash cannot leave monitoring
+-- permanently "running" and no valid current job is ever touched (2-hour
+-- threshold is well beyond the longest observed single-domain run in
+-- this project's history, ~13 minutes for Shopee finance's slowest run).
+-- To be added to scripts/run_production_cycle.py as a pre-flight step,
+-- NOT applied this pass:
+-- =====================================================================
+-- def finalize_stale_running_rows(cur):
+--     cur.execute("""
+--         UPDATE control.etl_run_log
+--         SET status = 'stale_abandoned',
+--             error_message = COALESCE(error_message, '') ||
+--                 ' [auto-finalized at cycle start: exceeded 2h running, ' ||
+--                 'process presumed crashed/killed]'
+--         WHERE status = 'running' AND started_at < now() - interval '2 hours'
+--         RETURNING etl_run_id;
+--     """)
+--     return cur.fetchall()
+
+-- =====================================================================
+-- Deeper fix (code-level, not SQL) — wrap the actual ETL entrypoint in
+-- incr_worker.py's __main__ block in try/finally so a crash always
+-- writes a terminal status (fail/stale) instead of relying solely on
+-- the periodic sweep above to catch it after the fact:
+--
+--   try:
+--       result = HANDLERS[domain](cur, etl_run_id, shop_id, window_start, window_end, log)
+--       ic.upsert_sync_state(...)
+--       finish_run(cur, etl_run_id, "success", ...)
+--   except Exception as e:
+--       finish_run(cur, etl_run_id, "fail", error_message=str(e))
+--       raise
+--   (finish_run already exists in some collectors per this project's
+--   history — this pass did not confirm it is used consistently across
+--   every entrypoint; that check is a required follow-up, not done here.)
+-- =====================================================================

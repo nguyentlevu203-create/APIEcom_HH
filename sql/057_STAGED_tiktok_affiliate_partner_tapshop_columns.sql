@@ -1,0 +1,47 @@
+-- =====================================================================
+-- 057_STAGED_tiktok_affiliate_partner_tapshop_columns.sql
+-- STATUS: STAGED / NOT APPLIED — pending human approval.
+--
+-- P8.7 fee standardization — promotes two of the three previously
+-- JSONB-only-captured TikTok affiliate/ads fee sub-fields to named,
+-- indexed columns, per Section H.2's requirement to "giữ component
+-- breakdown" explicitly (not just inside fee_tax_breakdown_raw).
+--
+-- Full-population reconciliation this session (2026-09-01..09-15, 1105
+-- matched orders, 1806 sku rows) proved these are the ONLY remaining
+-- unmapped nonzero fee sub-fields — order-level fee_and_tax_amount now
+-- reconciles to SUM(all 8 unique components) with a residual of exactly
+-- 0 (-61,686,347 == -61,686,347) once these two plus the already-
+-- captured affiliate_ads_commission_amount (sql/054) are included.
+--
+-- Values (VND, this window):
+--   affiliate_partner_commission_amount: sum=-341,354 across 23 sku rows
+--   tap_shop_ads_commission:             sum=-164,772 across 14 sku rows
+--
+-- CAPTURE ONLY. Additive. Does not alter fixed_fee/payment_fee/vxp_fee/
+-- infrastructure_fee/affiliate_fee or any existing column. Does NOT
+-- touch mart.v_ceo_ecom_daily or any CM1/CM2 formula — that wiring (if
+-- approved) is a SEPARATE staged change (see
+-- 058_STAGED_canonical_fee_components_view.sql and the P8.7 preview
+-- report) so the accounting-role decision and the capture decision can
+-- be approved independently.
+-- =====================================================================
+ALTER TABLE core.fact_settlement_sku_fee
+    ADD COLUMN IF NOT EXISTS affiliate_partner_commission_amount NUMERIC(18,4),
+    ADD COLUMN IF NOT EXISTS tap_shop_ads_commission_amount NUMERIC(18,4);
+
+-- Backfill statement (idempotent, run once the column exists; values
+-- already sit in fee_tax_breakdown_raw from the P8.6 backfill, so this
+-- needs NO new live API calls — pure in-database extraction):
+--
+-- UPDATE core.fact_settlement_sku_fee
+-- SET affiliate_partner_commission_amount = (fee_tax_breakdown_raw->'fee'->>'affiliate_partner_commission_amount')::numeric,
+--     tap_shop_ads_commission_amount = (fee_tax_breakdown_raw->'fee'->>'tap_shop_ads_commission')::numeric
+-- WHERE channel='TIKTOK' AND fee_tax_breakdown_raw IS NOT NULL
+--   AND (affiliate_partner_commission_amount IS NULL OR tap_shop_ads_commission_amount IS NULL);
+--
+-- Going-forward capture requires one code change: incr_worker.py's
+-- run_finance() INSERT should add these two columns, reading
+-- fee_tax.get("affiliate_partner_commission_amount") and
+-- fee_tax.get("tap_shop_ads_commission") — same pattern as
+-- affiliate_ads_commission_amount added in sql/054.

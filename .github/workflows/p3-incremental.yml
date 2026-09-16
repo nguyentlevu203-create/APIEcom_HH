@@ -1,0 +1,78 @@
+# P3 — V0 scheduled incremental ingestion (Shopee + TikTok).
+#
+# PREPARED, NOT ENABLED. This working root is not currently a git
+# repository (`git status` returns "fatal: not a git repository") and
+# has no GitHub remote/Actions context to verify credentials, secrets,
+# or runner access against — per the P3 instructions ("prepare, not
+# blindly enable... do NOT enable/push/start continuous scheduling if
+# repository/authentication context is not fully verified... do not
+# create a new repository automatically"), this file is written to disk
+# ready to use, but nothing has been pushed, no repository was
+# initialized, and no schedule is currently running anywhere.
+#
+# Before this can actually run on a schedule, a human needs to:
+#   1. `git init` this directory (or move it into an existing repo) and
+#      push it to GitHub — a deliberate decision this session does not
+#      make automatically.
+#   2. Add repository secrets equivalent to what this session reads
+#      from the local macOS Keychain (HH_ECOM_NEON/hh_etl_writer_database_url,
+#      the TikTok App Secret, the Shopee Partner Key) — GitHub Actions
+#      runners have no access to this machine's Keychain, so
+#      keyring.get_password() calls in incr_common.py / keychain.py /
+#      tiktok_shop/keychain.py would need an env-var-backed fallback
+#      that does not exist yet. That adaptation is explicitly OUT of
+#      P3's scope (Section 14 only requires reusing EXISTING secure
+#      credential storage) and is called out here, not silently
+#      papered over.
+#   3. Confirm tokens.json / shop_info.json for TikTok (currently local,
+#      git-ignored files) are provisioned on the runner some other way.
+#
+# Cron timezone note (verified, not assumed): GitHub Actions `schedule`
+# events run in UTC ONLY — there is no timezone field. The requested
+# cadence is "17 and 47 minutes past every hour, Asia/Ho_Chi_Minh".
+# Vietnam is UTC+7 with no daylight-saving offset (a whole-hour,
+# constant offset) — shifting a timestamp by a whole number of hours
+# changes only its HOUR field, never its MINUTE field. Since this
+# schedule fires on every hour (not a specific hour-of-day), the literal
+# cron expression "17,47 * * * *" already fires at :17/:47 in BOTH UTC
+# and Asia/Ho_Chi_Minh simultaneously — no conversion is needed or
+# possible to get "more correct" here. This is the verified, correct
+# expression, not a placeholder.
+
+name: P3 Incremental Ingestion (Shopee + TikTok)
+
+on:
+  # DISABLED on purpose — see header. Uncomment once steps 1-3 above are
+  # done and a human has reviewed this file in its actual repo context.
+  # schedule:
+  #   - cron: "17,47 * * * *"
+  workflow_dispatch: {}   # manual trigger only, for now
+
+jobs:
+  incremental:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        # integrations/shopee/ has no requirements.txt (verified before
+        # writing this file) — installing the actual runtime deps this
+        # pipeline imports directly instead of inventing a path.
+        run: |
+          pip install -r integrations/tiktok_shop/requirements.txt
+          pip install psycopg2-binary keyring requests
+
+      - name: Run incremental ingestion
+        # NOTE: as written, this step will fail on a hosted runner —
+        # keyring has no macOS Keychain to read from in this environment.
+        # See header note (2): a Keychain-vs-env-var credential source
+        # abstraction is required before this can actually execute here.
+        # Left as-is deliberately rather than silently working around it.
+        run: python3 pipelines/incremental.py
+        env:
+          TZ: UTC
