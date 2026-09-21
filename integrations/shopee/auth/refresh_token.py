@@ -26,15 +26,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from config import API_HOST, LIVE_PARTNER_ID, TOKEN_REFRESH_PATH  # noqa: E402
 from keychain import (  # noqa: E402
-    ACCOUNT_ACCESS_TOKEN,
-    ACCOUNT_ACCESS_TOKEN_EXPIRE_AT,
     ACCOUNT_LIVE_PARTNER_KEY,
     ACCOUNT_REFRESH_TOKEN,
-    ACCOUNT_REFRESH_TOKEN_EXPIRE_AT,
     ACCOUNT_SHOP_ID,
+    CredentialPersistenceCriticalFailure,
     get_secret,
-    has_secret,
-    set_secret,
+    persist_rotating_state,
 )
 
 
@@ -87,15 +84,21 @@ def main() -> int:
     access_expire_at = now + int(expire_in) if expire_in else now + 4 * 60 * 60
     refresh_expire_at = now + 30 * 24 * 60 * 60
 
-    set_secret(ACCOUNT_ACCESS_TOKEN, new_access)
-    set_secret(ACCOUNT_REFRESH_TOKEN, new_refresh)
-    set_secret(ACCOUNT_ACCESS_TOKEN_EXPIRE_AT, str(access_expire_at))
-    set_secret(ACCOUNT_REFRESH_TOKEN_EXPIRE_AT, str(refresh_expire_at))
+    print("refresh_attempted = true")
+    print("refresh_succeeded = true")
+
+    try:
+        persist_rotating_state(new_access, new_refresh, str(access_expire_at), str(refresh_expire_at))
+    except CredentialPersistenceCriticalFailure as exc:
+        del new_access, new_refresh
+        print("durable_persist_succeeded = false")
+        print(f"CREDENTIAL_PERSISTENCE_CRITICAL_FAILURE: {exc}")
+        return 1
     del new_access, new_refresh
 
+    print("durable_persist_succeeded = true")
+    print(f"credential_state_updated_at = {now}")
     print("SHOPEE REFRESH = PASS")
-    print(f"Access Token: {'FOUND' if has_secret(ACCOUNT_ACCESS_TOKEN) else 'NOT FOUND'}")
-    print(f"New Access Token Expiry (epoch): {access_expire_at}")
     return 0
 
 

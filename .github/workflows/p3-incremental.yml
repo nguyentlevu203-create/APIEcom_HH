@@ -25,12 +25,19 @@
 #                                     in this workflow: healthcheck + source-
 #                                     coverage snapshot only, never DDL)
 #   SHOPEE_LIVE_PARTNER_KEY
-#   SHOPEE_ACCESS_TOKEN
-#   SHOPEE_REFRESH_TOKEN
 #   SHOPEE_SHOP_ID
 #   SHOPEE_PARTNER_ID
-#   SHOPEE_ACCESS_TOKEN_EXPIRE_AT
-#   SHOPEE_REFRESH_TOKEN_EXPIRE_AT
+#   SHOPEE_ACCESS_TOKEN               (legacy bootstrap fallback — see P10-BIS)
+#   SHOPEE_REFRESH_TOKEN               (legacy bootstrap fallback — see P10-BIS)
+#   SHOPEE_ACCESS_TOKEN_EXPIRE_AT      (legacy bootstrap fallback — see P10-BIS)
+#   SHOPEE_REFRESH_TOKEN_EXPIRE_AT     (legacy bootstrap fallback — see P10-BIS)
+#   SHOPEE_TOKEN_STATE_JSON     (bundled rotating state; takes precedence
+#                                 once present — see integrations/shopee/
+#                                 keychain.py and github_secrets_writer.py)
+#   GH_SECRETS_WRITER_TOKEN     (fine-grained PAT, this repo only, Secrets:
+#                                 read/write — used to persist a rotated
+#                                 Shopee token state back into this list;
+#                                 default GITHUB_TOKEN cannot do this)
 #   TIKTOK_APP_SECRET
 #   TIKTOK_TOKENS_JSON        (full JSON content of tokens.json)
 #   TIKTOK_SHOP_INFO_JSON     (full JSON content of shop_info.json)
@@ -74,20 +81,20 @@ jobs:
 
       - uses: actions/setup-python@v5
         with:
-          # NOTE (portability audit, D1): local production Mac currently
-          # runs Python 3.14 (confirmed live via scripts/production_
-          # healthcheck.py's interpreter). This workflow pins 3.11
-          # (matches the original P3 draft and integrations/tiktok_shop/
-          # requirements.txt, which has no upper bound) — flagged, not
-          # silently resolved, since nothing in the codebase has been
-          # verified 3.14-specific, but a human should confirm before
-          # first real run.
+          # RESOLVED (P10-BIS.10, 2026-09-21): local production Mac runs
+          # Python 3.14, this workflow pins 3.11. Verified under a real
+          # isolated 3.11 venv (not just py_compile) rather than assumed:
+          # all Shopee credential-backend tests (16/16), all TikTok
+          # pilot_reporting tests (59/59), and all pipelines/ tests
+          # (80/80) pass; `python -m compileall` is clean across scripts/,
+          # pipelines/, integrations/shopee, integrations/tiktok_shop.
+          # 3.11 confirmed safe for this workflow.
           python-version: "3.11"
 
       - name: Install dependencies
         run: |
           pip install -r integrations/tiktok_shop/requirements.txt
-          pip install psycopg2-binary keyring requests
+          pip install psycopg2-binary keyring requests pynacl
 
       - name: Provision TikTok tokens (from secrets, never committed)
         # token_store.py reads these via a plain relative path
@@ -110,12 +117,27 @@ jobs:
           HH_ETL_WRITER_DATABASE_URL: ${{ secrets.HH_ETL_WRITER_DATABASE_URL }}
           HH_NEONDB_OWNER_DATABASE_URL: ${{ secrets.HH_NEONDB_OWNER_DATABASE_URL }}
           SHOPEE_LIVE_PARTNER_KEY: ${{ secrets.SHOPEE_LIVE_PARTNER_KEY }}
-          SHOPEE_ACCESS_TOKEN: ${{ secrets.SHOPEE_ACCESS_TOKEN }}
-          SHOPEE_REFRESH_TOKEN: ${{ secrets.SHOPEE_REFRESH_TOKEN }}
           SHOPEE_SHOP_ID: ${{ secrets.SHOPEE_SHOP_ID }}
           SHOPEE_PARTNER_ID: ${{ secrets.SHOPEE_PARTNER_ID }}
+          # Legacy individual rotating-field secrets — kept only as a
+          # backward-compatible bootstrap fallback (P10-BIS.2/.8). Once
+          # SHOPEE_TOKEN_STATE_JSON exists it takes precedence; these are
+          # read only if that bundle is absent or a field inside it is
+          # empty/null. See integrations/shopee/keychain.py.
+          SHOPEE_ACCESS_TOKEN: ${{ secrets.SHOPEE_ACCESS_TOKEN }}
+          SHOPEE_REFRESH_TOKEN: ${{ secrets.SHOPEE_REFRESH_TOKEN }}
           SHOPEE_ACCESS_TOKEN_EXPIRE_AT: ${{ secrets.SHOPEE_ACCESS_TOKEN_EXPIRE_AT }}
           SHOPEE_REFRESH_TOKEN_EXPIRE_AT: ${{ secrets.SHOPEE_REFRESH_TOKEN_EXPIRE_AT }}
+          # Bundled rotating-state snapshot (P10-BIS) — one atomic secret
+          # containing access_token/refresh_token/*_expire_at together, so
+          # a refresh mid-run never leaves a partially-updated legacy set.
+          SHOPEE_TOKEN_STATE_JSON: ${{ secrets.SHOPEE_TOKEN_STATE_JSON }}
+          # Dedicated fine-grained PAT (repo-scoped, Secrets: read/write
+          # only) used solely to durably persist a rotated Shopee token
+          # state back to this repo's Actions Secrets from inside the run
+          # — intentionally NOT the default GITHUB_TOKEN, which cannot
+          # write repository secrets, and NOT a broad personal PAT.
+          GH_SECRETS_WRITER_TOKEN: ${{ secrets.GH_SECRETS_WRITER_TOKEN }}
           TIKTOK_APP_SECRET: ${{ secrets.TIKTOK_APP_SECRET }}
 
       - name: Clean up provisioned token files
