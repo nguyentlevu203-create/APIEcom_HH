@@ -14,6 +14,14 @@ from canonical_normalizer import (
     field_present,
     normalize_shopee_escrow,
     normalize_tiktok_finance_sku,
+    strict_component_sum,
+    aggregate_tiktok_finance_skus,
+    audit_unknown_nonzero_components,
+    transaction_content_hash,
+    assign_occurrence_indices,
+    TIKTOK_SHIPPING_FORMULA_FIELDS,
+    TIKTOK_SHIPPING_KNOWN_ALWAYS_ZERO_FIELDS,
+    TIKTOK_SHIPPING_KNOWN_NESTED_FIELDS,
 )
 
 EVIDENCE_DIR = Path(__file__).parent.parent / "artifacts" / "v0" / "API_CONTRACT_AUDIT" / "RAW_EVIDENCE"
@@ -147,6 +155,7 @@ def _tt_tx(fee_overrides=None, shipping_overrides=None, revenue_overrides=None):
     shipping = {
         "actual_shipping_fee_amount": "0", "shipping_fee_discount_amount": "0",
         "customer_paid_shipping_fee_amount": "0", "failed_delivery_subsidy_amount": "0",
+        "return_shipping_fee_amount": "0",
     }
     shipping.update(shipping_overrides or {})
     revenue = {
@@ -214,3 +223,442 @@ def test_tiktok_alias_duplicate_not_double_counted():
     assert result["structured"]["affiliate_fee"] == Decimal("-150372")
     # the alias key never appears as its own structured column:
     assert "affiliate_commission_amount_before_pit" not in result["structured"]
+
+
+# =====================================================================
+# 4. strict_component_sum — Phase 6C Gate 1 fix. Regression coverage for
+#    the exact bug found and patched in this pass: a formula total must
+#    NEVER be a fabricated 0 (breakdown present but all-null) and must
+#    NEVER be a partial sum passed off as a complete total (breakdown
+#    present with only some fields populated). NULL != 0, PARTIAL !=
+#    COMPLETE, MISSING != ZERO, EXPLICIT_ZERO == 0.
+# =====================================================================
+
+def test_strict_component_sum_payload_not_dict_is_none():
+    assert strict_component_sum(None, ["a", "b"]) is None
+    assert strict_component_sum("not a dict", ["a", "b"]) is None
+
+
+def test_strict_component_sum_partial_is_none_not_partial_total():
+    assert strict_component_sum({"a": 10000}, ["a", "b"]) is None
+
+
+def test_strict_component_sum_all_explicit_zero_is_real_zero():
+    assert strict_component_sum({"a": 0, "b": "0"}, ["a", "b"]) == Decimal("0")
+
+
+def test_strict_component_sum_all_present_is_exact_sum():
+    assert strict_component_sum({"a": 10000, "b": -2500}, ["a", "b"]) == Decimal("7500")
+
+
+# ---- Shipping: 5 required cases ----
+
+def test_tiktok_shipping_case1_object_absent_is_none():
+    tx = _tt_tx()
+    tx["shipping_cost_breakdown"] = None
+    result = normalize_tiktok_finance_sku(tx)
+    assert result["computed_shipping_cost"] is None
+
+
+def test_tiktok_shipping_case2_object_present_all_null_is_none():
+    tx = _tt_tx(shipping_overrides={
+        "actual_shipping_fee_amount": None, "shipping_fee_discount_amount": None,
+        "customer_paid_shipping_fee_amount": None, "failed_delivery_subsidy_amount": None,
+    })
+    result = normalize_tiktok_finance_sku(tx)
+    assert result["computed_shipping_cost"] is None
+
+
+def test_tiktok_shipping_case3_partial_components_is_none_not_fabricated_total():
+    tx = _tt_tx(shipping_overrides={
+        "actual_shipping_fee_amount": 10000, "shipping_fee_discount_amount": None,
+        "customer_paid_shipping_fee_amount": None, "failed_delivery_subsidy_amount": None,
+    })
+    result = normalize_tiktok_finance_sku(tx)
+    assert result["computed_shipping_cost"] is None  # NOT 10000
+
+
+def test_tiktok_shipping_case4_all_explicit_zero_is_real_zero():
+    tx = _tt_tx(shipping_overrides={
+        "actual_shipping_fee_amount": 0, "shipping_fee_discount_amount": 0,
+        "customer_paid_shipping_fee_amount": 0, "failed_delivery_subsidy_amount": 0,
+    })
+    result = normalize_tiktok_finance_sku(tx)
+    assert result["computed_shipping_cost"] == Decimal("0")
+
+
+def test_tiktok_shipping_case5_all_complete_is_exact_sum():
+    tx = _tt_tx(shipping_overrides={
+        "actual_shipping_fee_amount": 20000, "shipping_fee_discount_amount": -5000,
+        "customer_paid_shipping_fee_amount": 15000, "failed_delivery_subsidy_amount": 0,
+    })
+    result = normalize_tiktok_finance_sku(tx)
+    assert result["computed_shipping_cost"] == Decimal("30000")
+
+
+# ---- Revenue: 5 required cases ----
+
+def test_tiktok_revenue_case6_object_absent_is_none():
+    tx = _tt_tx()
+    tx["revenue_breakdown"] = None
+    result = normalize_tiktok_finance_sku(tx)
+    assert result["computed_revenue"] is None
+
+
+def test_tiktok_revenue_case7_object_present_all_null_is_none():
+    tx = _tt_tx(revenue_overrides={
+        "subtotal_before_discount_amount": None, "seller_discount_amount": None,
+        "refund_subtotal_before_discount_amount": None, "seller_discount_refund_amount": None,
+    })
+    result = normalize_tiktok_finance_sku(tx)
+    assert result["computed_revenue"] is None
+
+
+def test_tiktok_revenue_case8_partial_components_is_none_not_fabricated_total():
+    tx = _tt_tx(revenue_overrides={
+        "subtotal_before_discount_amount": 269000, "seller_discount_amount": None,
+        "refund_subtotal_before_discount_amount": None, "seller_discount_refund_amount": None,
+    })
+    result = normalize_tiktok_finance_sku(tx)
+    assert result["computed_revenue"] is None  # NOT 269000
+
+
+def test_tiktok_revenue_case9_all_explicit_zero_is_real_zero():
+    tx = _tt_tx(revenue_overrides={
+        "subtotal_before_discount_amount": 0, "seller_discount_amount": 0,
+        "refund_subtotal_before_discount_amount": 0, "seller_discount_refund_amount": 0,
+    })
+    result = normalize_tiktok_finance_sku(tx)
+    assert result["computed_revenue"] == Decimal("0")
+
+
+def test_tiktok_revenue_case10_all_complete_is_exact_sum():
+    tx = _tt_tx(revenue_overrides={
+        "subtotal_before_discount_amount": "269000", "seller_discount_amount": "-74000",
+        "refund_subtotal_before_discount_amount": "-269000", "seller_discount_refund_amount": "74000",
+    })
+    result = normalize_tiktok_finance_sku(tx)
+    assert result["computed_revenue"] == Decimal("0")
+
+
+# =====================================================================
+# 5. Gate 5 remediation (2026-09-21) — return_shipping_fee_amount fix +
+#    aggregate_tiktok_finance_skus (multi-transaction-per-sku_id bug).
+#    Regression coverage tied to real orders found live on production
+#    during the Gate 5 investigation (read-only; no values invented).
+# =====================================================================
+
+def test_tiktok_shipping_formula_includes_return_shipping_fee_amount():
+    # Regression for order 582847227535525582 (live production, 2026-09-21):
+    # return_shipping_fee_amount=-41250 was present and nonzero but NOT in
+    # the old 4-field formula, understating computed_shipping_cost by
+    # exactly that amount versus TikTok's own order-level shipping_cost_amount.
+    tx = _tt_tx(shipping_overrides={
+        "actual_shipping_fee_amount": "-75400", "shipping_fee_discount_amount": "0",
+        "customer_paid_shipping_fee_amount": "0", "failed_delivery_subsidy_amount": "0",
+        "return_shipping_fee_amount": "-41250",
+    })
+    result = normalize_tiktok_finance_sku(tx)
+    assert result["computed_shipping_cost"] == Decimal("-116650")  # matches live order-level shipping_cost_amount
+
+
+def test_tiktok_shipping_missing_return_shipping_fee_amount_is_none_not_partial():
+    # If return_shipping_fee_amount is present on the breakdown object
+    # elsewhere in the population but absent on THIS tx, the formula must
+    # still be all-or-nothing (never silently treat it as 0).
+    tx = _tt_tx(shipping_overrides={"actual_shipping_fee_amount": "-75400"})
+    del tx["shipping_cost_breakdown"]["return_shipping_fee_amount"]
+    # remaining formula fields default to "0" from _tt_tx, but return_shipping_fee_amount is now absent
+    assert "return_shipping_fee_amount" not in tx["shipping_cost_breakdown"]
+    result = normalize_tiktok_finance_sku(tx)
+    assert result["computed_shipping_cost"] is None
+
+
+def test_aggregate_single_transaction_matches_normalize():
+    tx = _tt_tx(fee_overrides={"platform_commission_amount": "-1000"})
+    single = normalize_tiktok_finance_sku(tx)
+    agg = aggregate_tiktok_finance_skus([tx])
+    assert agg["structured"]["fixed_fee"] == single["structured"]["fixed_fee"]
+    assert agg["computed_shipping_cost"] == single["computed_shipping_cost"]
+    assert agg["n_transactions"] == 1
+    assert agg["fee_tax_breakdown_raw"] == [single["fee_tax_breakdown_raw"]]
+
+
+def test_aggregate_multi_transaction_real_plus_allzero_sums_correctly():
+    # Regression for order 585474165265106454 (live production, 2026-09-21):
+    # 4 sku_transactions covering only 2 distinct sku_id values (2 real +
+    # 2 all-zero duplicates). The old write path (upsert on order_id+sku_id,
+    # no statement_id) kept only the LAST entry per sku_id and lost the
+    # real one whenever the zero-entry was processed after it -- DB showed
+    # sku-level revenue=0 while TikTok's own order-level total was 336000.
+    tx_real = _tt_tx(revenue_overrides={
+        "subtotal_before_discount_amount": "499000", "seller_discount_amount": "-163000",
+    })
+    tx_zero = _tt_tx()  # all revenue fields default to explicit "0" in _tt_tx
+    agg = aggregate_tiktok_finance_skus([tx_real, tx_zero])
+    assert agg["computed_revenue"] == Decimal("336000")
+    assert agg["n_transactions"] == 2
+
+
+def test_aggregate_refund_adjustment_nets_to_zero():
+    # Regression for order 585281732040688940's sku_id 1735775277759694044
+    # (live production): an original-sale line and a separate
+    # refund-adjustment line for the SAME sku_id, opposite sign, net to 0 --
+    # proving the old last-write-wins path could report either +219000 or
+    # -219000 (whichever line was processed last) instead of the true 0.
+    tx_sale = _tt_tx(revenue_overrides={
+        "subtotal_before_discount_amount": "435000", "seller_discount_amount": "-216000",
+    })
+    tx_refund = _tt_tx(revenue_overrides={
+        "refund_subtotal_before_discount_amount": "-435000", "seller_discount_refund_amount": "216000",
+    })
+    agg = aggregate_tiktok_finance_skus([tx_sale, tx_refund])
+    assert agg["computed_revenue"] == Decimal("0")
+
+
+def test_aggregate_partial_one_entry_none_field_contributes_zero_not_none():
+    # Deliberately different rule from strict_component_sum: a field that
+    # is None on ONE transaction entry (fee code not applicable to that
+    # specific transaction) must not null out the whole aggregate when
+    # another entry in the group has a real value.
+    tx_with_fee = _tt_tx(fee_overrides={"platform_commission_amount": "-500"})
+    tx_without_fee = _tt_tx()
+    del tx_without_fee["fee_tax_breakdown"]["fee"]["platform_commission_amount"]
+    agg = aggregate_tiktok_finance_skus([tx_with_fee, tx_without_fee])
+    assert agg["structured"]["fixed_fee"] == Decimal("-500")
+
+
+def test_aggregate_all_entries_missing_field_stays_none():
+    tx1 = _tt_tx()
+    tx2 = _tt_tx()
+    del tx1["fee_tax_breakdown"]["fee"]["platform_commission_amount"]
+    del tx2["fee_tax_breakdown"]["fee"]["platform_commission_amount"]
+    agg = aggregate_tiktok_finance_skus([tx1, tx2])
+    assert agg["structured"]["fixed_fee"] is None
+
+
+def test_aggregate_all_explicit_zero_across_entries_is_real_zero():
+    tx1 = _tt_tx()
+    tx2 = _tt_tx()
+    agg = aggregate_tiktok_finance_skus([tx1, tx2])
+    assert agg["computed_shipping_cost"] == Decimal("0")
+    assert agg["computed_revenue"] == Decimal("0")
+    assert agg["structured"]["fixed_fee"] == Decimal("0")
+
+
+# =====================================================================
+# 6. audit_unknown_nonzero_components — B1 requirement: detect (not
+#    silently ignore) a raw component nobody has evaluated yet.
+# =====================================================================
+
+def test_audit_clean_payload_flags_nothing():
+    payload = {f: "0" for f in TIKTOK_SHIPPING_FORMULA_FIELDS}
+    payload.update({f: "0" for f in TIKTOK_SHIPPING_KNOWN_ALWAYS_ZERO_FIELDS})
+    payload["supplementary_component"] = {"anything": "0"}
+    result = audit_unknown_nonzero_components(
+        payload, TIKTOK_SHIPPING_FORMULA_FIELDS,
+        TIKTOK_SHIPPING_KNOWN_ALWAYS_ZERO_FIELDS, TIKTOK_SHIPPING_KNOWN_NESTED_FIELDS,
+    )
+    assert result == []
+
+
+def test_audit_flags_genuinely_unknown_nonzero_field():
+    # Simulates TikTok adding a brand-new shipping fee sub-field tomorrow.
+    payload = {f: "0" for f in TIKTOK_SHIPPING_FORMULA_FIELDS}
+    payload["brand_new_fee_field_amount"] = "-5000"
+    result = audit_unknown_nonzero_components(
+        payload, TIKTOK_SHIPPING_FORMULA_FIELDS,
+        TIKTOK_SHIPPING_KNOWN_ALWAYS_ZERO_FIELDS, TIKTOK_SHIPPING_KNOWN_NESTED_FIELDS,
+    )
+    assert result == [("brand_new_fee_field_amount", Decimal("-5000"))]
+
+
+def test_audit_known_always_zero_field_going_nonzero_is_flagged():
+    # A field previously proven always-zero (so excluded from the formula)
+    # turning nonzero must surface, not be silently absorbed as "known".
+    payload = {f: "0" for f in TIKTOK_SHIPPING_FORMULA_FIELDS}
+    payload["logistics_service_fee"] = "1234"  # was always 0 as of 2026-09-21
+    result = audit_unknown_nonzero_components(
+        payload, TIKTOK_SHIPPING_FORMULA_FIELDS, set(), TIKTOK_SHIPPING_KNOWN_NESTED_FIELDS,
+    )
+    assert ("logistics_service_fee", Decimal("1234")) in result
+
+
+def test_audit_nested_dict_never_flagged_even_if_it_looks_nonzero():
+    payload = {f: "0" for f in TIKTOK_SHIPPING_FORMULA_FIELDS}
+    payload["supplementary_component"] = {"platform_shipping_fee_discount_amount": "9999"}
+    result = audit_unknown_nonzero_components(
+        payload, TIKTOK_SHIPPING_FORMULA_FIELDS,
+        TIKTOK_SHIPPING_KNOWN_ALWAYS_ZERO_FIELDS, TIKTOK_SHIPPING_KNOWN_NESTED_FIELDS,
+    )
+    assert result == []
+
+
+# =====================================================================
+# 7. transaction_content_hash + assign_occurrence_indices (Task A/B —
+#    TRANSACTION_IDEMPOTENCY_MODEL=H2) — regression coverage for the
+#    exact live patterns found on production, 2026-09-21:
+#      - order 585474165265106454: two entries sharing (sku_id,
+#        statement_id) with DIFFERENT settlement_amount (proves
+#        statement_id alone is not a safe key).
+#      - cross-order duplicate-hash probe (55 orders / 120 entries):
+#        an identical (sku_id, statement_id, all-zero values) entry
+#        observed on 2+ DIFFERENT order_ids (proves content_hash alone,
+#        without order_id, is not globally unique -- order_id must be a
+#        separate column in the DB unique key, not hashed in).
+# =====================================================================
+
+def _canon_tx(sku_id, statement_id, settlement_amount, revenue_amount="0",
+              shipping_cost_amount="0", fee_tax_amount="0"):
+    return {
+        "sku_id": sku_id, "statement_id": statement_id,
+        "settlement_amount": settlement_amount, "revenue_amount": revenue_amount,
+        "shipping_cost_amount": shipping_cost_amount, "fee_tax_amount": fee_tax_amount,
+        "sku_name": None, "product_name": None, "quantity": None,
+        "fee_tax_breakdown": {}, "revenue_breakdown": {}, "shipping_cost_breakdown": {},
+    }
+
+
+def test_content_hash_identical_replay_is_stable():
+    tx = _canon_tx("1735775277759694044", "7669237315507767060", "166946", revenue_amount="219000")
+    h1 = transaction_content_hash(tx)
+    h2 = transaction_content_hash(dict(tx))
+    assert h1 == h2
+
+
+def test_content_hash_same_sku_and_statement_id_but_different_amount_differs():
+    # Real production pattern: order 585474165265106454 tx[0] vs tx[2].
+    tx_real = _canon_tx("1735734212755293404", "7672589526459598609", "230539", revenue_amount="336000", fee_tax_amount="-105461")
+    tx_zero = _canon_tx("1735734212755293404", "7672589526459598609", "0")
+    assert transaction_content_hash(tx_real) != transaction_content_hash(tx_zero)
+
+
+def test_content_hash_sale_then_refund_adjustment_different_statement_ids_distinct():
+    tx_sale = _canon_tx("1735775277759694044", "7669237315507767060", "166946", revenue_amount="219000", fee_tax_amount="-52054")
+    tx_refund = _canon_tx("1735775277759694044", "7678133531121469202", "-166946", revenue_amount="-219000", fee_tax_amount="52054")
+    assert transaction_content_hash(tx_sale) != transaction_content_hash(tx_refund)
+
+
+def test_content_hash_does_not_depend_on_order_id():
+    # order_id is deliberately NOT part of the hash -- proven live that
+    # identical content legitimately repeats across different orders
+    # (a shared all-zero placeholder statement line). Uniqueness comes
+    # from the DB key (order_id, content_hash, occurrence_index), not
+    # from folding order_id into the hash itself.
+    tx = _canon_tx("1735801927555253468", "7672589526459598609", "0")
+    assert transaction_content_hash(tx) == transaction_content_hash(dict(tx))
+
+
+# ---- D3/D4: occurrence_index (H2 model) ----
+
+def test_occurrence_index_no_duplicates_all_zero():
+    tx_a = _canon_tx("skuA", "stmt1", "100")
+    tx_b = _canon_tx("skuB", "stmt2", "200")
+    result = assign_occurrence_indices([tx_a, tx_b])
+    assert [idx for _, _, idx in result] == [0, 0]
+    assert len({h for _, h, _ in result}) == 2  # distinct content -> distinct hashes
+
+
+def test_occurrence_index_same_sku_statement_different_amount_both_index_0():
+    # D3: same sku_id + same statement_id, different amount -- these are
+    # DIFFERENT content (different hash), so each is its own index-0.
+    tx_real = _canon_tx("skuA", "stmt1", "230539", revenue_amount="336000")
+    tx_zero = _canon_tx("skuA", "stmt1", "0")
+    result = assign_occurrence_indices([tx_real, tx_zero])
+    hashes = [h for _, h, _ in result]
+    indices = [idx for _, _, idx in result]
+    assert hashes[0] != hashes[1]
+    assert indices == [0, 0]  # distinct hashes, each first-seen
+
+
+def test_occurrence_index_true_duplicate_entries_get_0_and_1():
+    # D4: TWO byte-identical source entries in the SAME order (never
+    # observed live in the 55-order sample, but the design must not
+    # assume it can't happen) -- must survive as 2 rows, indices 0 and 1.
+    tx = _canon_tx("skuA", "stmt1", "100")
+    result = assign_occurrence_indices([tx, dict(tx)])
+    assert [h for _, h, _ in result][0] == [h for _, h, _ in result][1]
+    assert [idx for _, _, idx in result] == [0, 1]
+
+
+def test_occurrence_index_deterministic_across_replay():
+    # Re-fetch stability proven live (identical array order across 2
+    # calls, 4/4 orders) -- replaying the identical tx_list must assign
+    # the identical occurrence_index each time, so ON CONFLICT DO
+    # NOTHING on (order_id, content_hash, occurrence_index) is a safe no-op.
+    tx_list = [_canon_tx("skuA", "stmt1", "100"), _canon_tx("skuA", "stmt1", "100"), _canon_tx("skuB", "stmt2", "200")]
+    result1 = [(h, idx) for _, h, idx in assign_occurrence_indices(tx_list)]
+    result2 = [(h, idx) for _, h, idx in assign_occurrence_indices([dict(tx) for tx in tx_list])]
+    assert result1 == result2
+
+
+# ---- Append-only store simulation (H2 model, order_id + content_hash + occurrence_index key) ----
+
+def test_idempotent_replay_no_duplicate_no_double_sum():
+    """Simulate the H2 append-only store across three fetch cycles for
+    ONE order: (1) sale only, (2) sale + refund adjustment appears,
+    (3) same sale + refund re-fetched again. Final state must equal
+    exactly {sale, refund} once each, total reflects each exactly once."""
+    order_id = "585281732040688940"
+    tx_sale = _canon_tx("1735775277759694044", "7669237315507767060", "166946", revenue_amount="219000")
+    tx_refund = _canon_tx("1735775277759694044", "7678133531121469202", "-166946", revenue_amount="-219000")
+
+    store: dict[tuple, dict] = {}  # (order_id, content_hash, occurrence_index) -> tx
+
+    def apply_fetch(tx_list):
+        for tx, h, idx in assign_occurrence_indices(tx_list):
+            key = (order_id, h, idx)
+            if key not in store:  # ON CONFLICT (order_id, content_hash, occurrence_index) DO NOTHING
+                store[key] = tx
+
+    apply_fetch([tx_sale])                    # cycle 1
+    assert len(store) == 1
+    apply_fetch([tx_sale, tx_refund])          # cycle 2 -- sale re-seen, refund is new
+    assert len(store) == 2
+    apply_fetch([tx_sale, tx_refund])          # cycle 3 -- both re-seen again, must not double-add
+    assert len(store) == 2
+
+    total_revenue = sum(Decimal(tx["revenue_amount"]) for tx in store.values())
+    assert total_revenue == Decimal("0")  # sale (219000) + refund (-219000), each counted exactly once
+
+
+def test_idempotent_true_duplicate_multiplicity_survives_replay():
+    """D6+D4 combined: two byte-identical entries in one order, fetched
+    three times -- multiplicity must stay 2, never collapse to 1 and
+    never grow past 2."""
+    order_id = "585999999999999999"
+    tx = _canon_tx("skuA", "stmt1", "100")
+
+    store: dict[tuple, dict] = {}
+
+    def apply_fetch(tx_list):
+        for t, h, idx in assign_occurrence_indices(tx_list):
+            key = (order_id, h, idx)
+            if key not in store:
+                store[key] = t
+
+    apply_fetch([tx, dict(tx)])
+    assert len(store) == 2
+    apply_fetch([tx, dict(tx)])  # replay
+    assert len(store) == 2
+    total = sum(Decimal(t["settlement_amount"]) for t in store.values())
+    assert total == Decimal("200")  # both real occurrences counted, no more no less
+
+
+def test_idempotent_full_replay_of_same_payload_twice_matches_aggregate():
+    """Replaying the EXACT same API payload twice must not change the
+    canonical aggregate computed via aggregate_tiktok_finance_skus."""
+    tx1 = _tt_tx(revenue_overrides={"subtotal_before_discount_amount": "499000", "seller_discount_amount": "-163000"})
+    tx2 = _tt_tx()
+    first = aggregate_tiktok_finance_skus([tx1, tx2])
+    second = aggregate_tiktok_finance_skus([tx1, tx2])
+    assert first["computed_revenue"] == second["computed_revenue"] == Decimal("336000")
+
+
+# NOTE: "one-side API failure" and "retry" (from the Phase 6C Gate 5 task
+# spec) are HTTP/session-layer concerns that live in incr_worker.py's
+# ic.with_backoff()/session handling, not in this pure-function module --
+# they need live or mocked API behavior to test meaningfully and are out
+# of scope for canonical_normalizer's no-DB/no-network unit tests. Not
+# fabricated here; flagged as a gap for whoever wires
+# aggregate_tiktok_finance_skus into incr_worker.py's write loop.
