@@ -34,6 +34,11 @@
 #   SHOPEE_TOKEN_STATE_JSON     (bundled rotating state; takes precedence
 #                                 once present — see integrations/shopee/
 #                                 keychain.py and github_secrets_writer.py)
+#   SHOPEE_AMS_LIVE_PARTNER_KEY (AMS app, id 2044772 — separate from the
+#                                 main app above, see auth/token_exchange_ams.py)
+#   SHOPEE_AMS_SHOP_ID
+#   SHOPEE_AMS_TOKEN_STATE_JSON (AMS bundled rotating state — P11-BIS,
+#                                 independent of SHOPEE_TOKEN_STATE_JSON)
 #   GH_SECRETS_WRITER_TOKEN     (fine-grained PAT, this repo only, Secrets:
 #                                 read/write — used to persist a rotated
 #                                 Shopee token state back into this list;
@@ -73,7 +78,14 @@ concurrency:
 jobs:
   incremental:
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    # P11-BIS (2026-09-21): 25 min was too short for a cold, multi-day
+    # catch-up run (schedule had been disabled) — the first real
+    # workflow_dispatch run was killed by this timeout mid-cycle after
+    # Shopee finance alone took ~17 min. 60 min gives real headroom for
+    # a catch-up while still bounding a genuinely hung job. Not removed
+    # entirely, not parallelized — revisit downward once steady-state
+    # (small incremental window) run durations are observed.
+    timeout-minutes: 60
     env:
       TZ: UTC
     steps:
@@ -132,6 +144,14 @@ jobs:
           # containing access_token/refresh_token/*_expire_at together, so
           # a refresh mid-run never leaves a partially-updated legacy set.
           SHOPEE_TOKEN_STATE_JSON: ${{ secrets.SHOPEE_TOKEN_STATE_JSON }}
+          # AMS (affiliate) app — a SEPARATE Shopee app (id 2044772) from
+          # the main one above, with its own static credentials and its
+          # own rotating-state bundle (P11-BIS). Never mixed with the
+          # SHOPEE_* names above. See integrations/shopee/auth/
+          # token_exchange_ams.py.
+          SHOPEE_AMS_LIVE_PARTNER_KEY: ${{ secrets.SHOPEE_AMS_LIVE_PARTNER_KEY }}
+          SHOPEE_AMS_SHOP_ID: ${{ secrets.SHOPEE_AMS_SHOP_ID }}
+          SHOPEE_AMS_TOKEN_STATE_JSON: ${{ secrets.SHOPEE_AMS_TOKEN_STATE_JSON }}
           # Dedicated fine-grained PAT (repo-scoped, Secrets: read/write
           # only) used solely to durably persist a rotated Shopee token
           # state back to this repo's Actions Secrets from inside the run
