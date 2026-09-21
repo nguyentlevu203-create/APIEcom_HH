@@ -17,6 +17,7 @@ import json
 import sys
 import time
 from datetime import datetime, timedelta
+from decimal import Decimal
 from pathlib import Path
 
 PILOT_DIR = Path(__file__).resolve().parent
@@ -27,7 +28,13 @@ sys.path.insert(0, str(PILOT_DIR))  # pilot_common.py inserts INTEGRATION_DIR it
 import pilot_common  # noqa: E402
 import collect as tt_collect  # noqa: E402
 import incr_common as ic  # noqa: E402
-from canonical_normalizer import normalize_tiktok_finance_sku  # noqa: E402
+from canonical_normalizer import (  # noqa: E402
+    normalize_tiktok_finance_sku, aggregate_tiktok_finance_skus,
+    assign_occurrence_indices, audit_unknown_nonzero_components,
+    TIKTOK_SHIPPING_FORMULA_FIELDS, TIKTOK_SHIPPING_KNOWN_ALWAYS_ZERO_FIELDS,
+    TIKTOK_SHIPPING_KNOWN_NESTED_FIELDS, TIKTOK_REVENUE_FORMULA_FIELDS,
+    TIKTOK_REVENUE_KNOWN_ALWAYS_ZERO_FIELDS, TIKTOK_REVENUE_KNOWN_NESTED_FIELDS,
+)
 
 
 def tiktok_check(status: str, label: str) -> None:
@@ -213,6 +220,7 @@ def run_finance(cur, etl_run_id, shop_id, window_start, window_end, log) -> dict
 
     ctr = ic.Counters()
     sku_fee_ctr = ic.Counters()
+    sku_tx_ctr = ic.Counters()
     for oid in order_ids:
         def call(oid=oid):
             return session.client.read_domain(
@@ -234,21 +242,98 @@ def run_finance(cur, etl_run_id, shop_id, window_start, window_end, log) -> dict
             # order_create_time from THIS SAME response — the locked
             # create_time contract — never the settlement check-date.
             order_bd = ic.vn_date(ic.ts_from_epoch(d.get("order_create_time"))) if d.get("order_create_time") else None
-            for tx in d.get("sku_transactions", []):
+
+            # Phase 6C Gate 5 grain fix (Design 3 / H2) — TikTok can
+            # return MULTIPLE sku_transaction entries sharing one
+            # sku_id (e.g. a sale line + a separate refund-adjustment
+            # line, each its own statement_id — proven live, order
+            # 585474165265106454). Step 1: persist EVERY entry, lossless,
+            # into the transaction-grain table BEFORE deriving anything
+            # aggregate — never skip this even for a single-entry sku_id,
+            # so this table is always the complete source of truth.
+            valid_tx = [tx for tx in d.get("sku_transactions", []) if tx.get("sku_id")]
+            for tx, content_hash, occurrence_index in assign_occurrence_indices(valid_tx):
                 sku_id = tx.get("sku_id")
-                if not sku_id:
-                    continue
-                # Phase 6A — canonical normalizer produces structured
-                # fields + raw payloads from the SAME tx object in one
-                # call, closing the RAW_ENRICHMENT_BACKFILL_BYPASSED_
-                # NORMALIZER gap (any future re-fetch of this endpoint,
-                # including repair/backfill scripts, must go through
-                # this same function — see RAW_ONLY_WRITER_INVENTORY.csv).
-                norm = normalize_tiktok_finance_sku(tx)
-                s = norm["structured"]
-                fee_tax_raw = json.dumps(norm["fee_tax_breakdown_raw"]) if norm["fee_tax_breakdown_raw"] is not None else None
-                revenue_raw = json.dumps(norm["revenue_breakdown_raw"]) if norm["revenue_breakdown_raw"] is not None else None
-                shipping_raw = json.dumps(norm["shipping_cost_breakdown_raw"]) if norm["shipping_cost_breakdown_raw"] is not None else None
+                norm_tx = normalize_tiktok_finance_sku(tx)
+                st = norm_tx["structured"]
+                cur.execute(
+                    """
+                    INSERT INTO core.fact_settlement_sku_transaction (
+                        channel, shop_id, order_id, sku_id, statement_id, business_date,
+                        quantity, settlement_amount, revenue_amount, shipping_cost_amount, fee_tax_amount,
+                        fixed_fee, payment_fee, vxp_fee, infrastructure_fee, affiliate_fee,
+                        affiliate_ads_commission_amount, affiliate_partner_commission_amount, tap_shop_ads_commission_amount,
+                        sku_name, product_name,
+                        fee_tax_breakdown_raw, revenue_breakdown_raw, shipping_cost_breakdown_raw,
+                        content_hash, occurrence_index,
+                        source_system, source_endpoint, source_updated_at, etl_run_id
+                    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s::jsonb,%s,%s,
+                        'TIKTOK', '/finance/202501/orders/{order_id}/statement_transactions', now(), %s)
+                    ON CONFLICT (channel, shop_id, order_id, content_hash, occurrence_index) DO NOTHING
+                    RETURNING id;
+                    """,
+                    (
+                        "TIKTOK", shop_id, oid, sku_id, tx.get("statement_id"), order_bd,
+                        ic.dec(tx.get("quantity")), ic.dec(tx.get("settlement_amount")),
+                        ic.dec(tx.get("revenue_amount")), ic.dec(tx.get("shipping_cost_amount")), ic.dec(tx.get("fee_tax_amount")),
+                        st["fixed_fee"], st["payment_fee"], st["vxp_fee"], st["infrastructure_fee"], st["affiliate_fee"],
+                        st["affiliate_ads_commission_amount"], st["affiliate_partner_commission_amount"], st["tap_shop_ads_commission_amount"],
+                        tx.get("sku_name"), tx.get("product_name"),
+                        json.dumps(norm_tx["fee_tax_breakdown_raw"]) if norm_tx["fee_tax_breakdown_raw"] is not None else None,
+                        json.dumps(norm_tx["revenue_breakdown_raw"]) if norm_tx["revenue_breakdown_raw"] is not None else None,
+                        json.dumps(norm_tx["shipping_cost_breakdown_raw"]) if norm_tx["shipping_cost_breakdown_raw"] is not None else None,
+                        content_hash, occurrence_index, etl_run_id,
+                    ),
+                )
+                # ON CONFLICT DO NOTHING (append-only — see sql/061's
+                # IMMUTABLE_EVENT_LEDGER semantics) returns no row on a
+                # dedup skip; Counters.record(bool) is reused here as
+                # "inserted vs already-present", not its usual
+                # inserted-vs-updated meaning (this table is never
+                # UPDATEd by this path).
+                sku_tx_ctr.record(cur.fetchone() is not None)
+
+                # C4 — unknown-nonzero-component guard: never silently
+                # compute an incomplete total. Persisting raw above
+                # already happened regardless of this check (safer than
+                # failing ingestion over a still-unclassified field);
+                # this only emits a DQ warning to the run log.
+                for label, bd, formula, known_zero, known_nested in (
+                    ("shipping", tx.get("shipping_cost_breakdown"), TIKTOK_SHIPPING_FORMULA_FIELDS,
+                     TIKTOK_SHIPPING_KNOWN_ALWAYS_ZERO_FIELDS, TIKTOK_SHIPPING_KNOWN_NESTED_FIELDS),
+                    ("revenue", tx.get("revenue_breakdown"), TIKTOK_REVENUE_FORMULA_FIELDS,
+                     TIKTOK_REVENUE_KNOWN_ALWAYS_ZERO_FIELDS, TIKTOK_REVENUE_KNOWN_NESTED_FIELDS),
+                ):
+                    unknown = audit_unknown_nonzero_components(bd, formula, known_zero, known_nested)
+                    if unknown:
+                        log(f"DQ_WARNING unknown_nonzero_component order={oid} sku={sku_id} "
+                            f"statement={tx.get('statement_id')} kind={label} fields={unknown} "
+                            f"-- computed total may be INCOMPLETE, raw was still persisted")
+
+            # Step 2: derive the canonical order+sku aggregate from the
+            # SAME in-memory tx list just persisted (no extra API/DB
+            # round trip needed) — SUM across every real transaction for
+            # that sku_id, never last-write-wins.
+            by_sku: dict[str, list] = {}
+            for tx in valid_tx:
+                by_sku.setdefault(tx.get("sku_id"), []).append(tx)
+
+            for sku_id, tx_group in by_sku.items():
+                agg = aggregate_tiktok_finance_skus(tx_group)
+                s = agg["structured"]
+                # C2 — fact_settlement_sku_fee's raw columns cannot
+                # losslessly represent an aggregate of >1 source entry as
+                # a single flat object. They are explicitly INFORMATIONAL
+                # ONLY here (the entry with the largest |settlement_amount|
+                # in the group) — full lossless fidelity lives in
+                # core.fact_settlement_sku_transaction, not in this column.
+                representative = max(
+                    tx_group,
+                    key=lambda t: abs(ic.dec(t.get("settlement_amount")) or Decimal(0)),
+                )
+                fee_tax_raw = json.dumps(representative.get("fee_tax_breakdown")) if representative.get("fee_tax_breakdown") is not None else None
+                revenue_raw = json.dumps(representative.get("revenue_breakdown")) if representative.get("revenue_breakdown") is not None else None
+                shipping_raw = json.dumps(representative.get("shipping_cost_breakdown")) if representative.get("shipping_cost_breakdown") is not None else None
                 cur.execute(
                     """
                     INSERT INTO core.fact_settlement_sku_fee (
@@ -273,8 +358,8 @@ def run_finance(cur, etl_run_id, shop_id, window_start, window_end, log) -> dict
                     RETURNING (xmax = 0) AS inserted;
                     """,
                     (
-                        "TIKTOK", shop_id, oid, sku_id, tx.get("statement_id"), order_bd,
-                        ic.dec(tx.get("revenue_amount")), s["fixed_fee"], s["payment_fee"], s["vxp_fee"],
+                        "TIKTOK", shop_id, oid, sku_id, representative.get("statement_id"), order_bd,
+                        agg["computed_revenue"], s["fixed_fee"], s["payment_fee"], s["vxp_fee"],
                         s["infrastructure_fee"], s["affiliate_fee"], s["affiliate_ads_commission_amount"],
                         fee_tax_raw, revenue_raw, shipping_raw,
                         currency, f"{oid}:{sku_id}", etl_run_id,
@@ -310,7 +395,10 @@ def run_finance(cur, etl_run_id, shop_id, window_start, window_end, log) -> dict
         )
         ctr.record(cur.fetchone()[0])
         time.sleep(0.12)
-    return {"settlement": ctr.as_dict(), "settlement_sku_fee": sku_fee_ctr.as_dict()}
+    return {
+        "settlement": ctr.as_dict(), "settlement_sku_fee": sku_fee_ctr.as_dict(),
+        "settlement_sku_transaction": sku_tx_ctr.as_dict(),
+    }
 
 
 def run_affiliate(cur, etl_run_id, shop_id, window_start, window_end, log) -> dict:
