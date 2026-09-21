@@ -1,0 +1,69 @@
+-- =====================================================================
+-- 062_STAGED_canonical_fee_components_view_v3_addendum.sql
+-- STATUS: INCORPORATED_INTO_063 (2026-09-21) — the full, directly
+-- executable view this addendum described is now
+-- sql/063_STAGED_canonical_fee_components_view_v3.sql. Kept as
+-- reasoning/audit-history only; do not compose this by hand anymore.
+-- STATUS: STAGED / NOT APPLIED. Phase 6C Task C — sql/060 dependency
+-- reassessment after the transaction-grain fix (sql/061).
+--
+-- Does sql/060 (v2) need to change? YES, for exactly 2 of its 8 TikTok
+-- Finance-domain fee_codes: TIKTOK_AFFILIATE_PARTNER_COMMISSION and
+-- TIKTOK_TAP_SHOP_ADS_COMMISSION. Confirmed by reading sql/060 directly
+-- (grep, 2026-09-21): both read fee_tax_breakdown_raw ON
+-- core.fact_settlement_sku_fee -- the very column whose value the
+-- multi-transaction collision bug can silently undercount (same root
+-- cause as the revenue residual, since sql/060 sums this raw column
+-- across sku_fee ROWS the same way canonical_normalizer used to sum
+-- breakdown FIELDS within one row). The other 6 TikTok fee_codes
+-- (5 base CM1/CM2 + none else) read fact_settlement_sku_fee's
+-- STRUCTURED columns (fixed_fee, payment_fee, ...), which automatically
+-- inherit the fix once the write path aggregates from
+-- core.fact_settlement_sku_transaction (sql/061) instead of upserting
+-- the last-seen entry -- sql/060's SQL TEXT does not need to change for
+-- those 6, only the write path behind the columns it already reads.
+--
+-- This file is NOT a full CREATE OR REPLACE VIEW (sql/060 is ~240 lines
+-- and the other 90% is unchanged) -- it documents the EXACT replacement
+-- for the 2 affected VALUES(...) entries inside sql/060's
+-- CROSS JOIN LATERAL block. Composing this into a real v3
+-- "CREATE OR REPLACE VIEW mart.v_ai_fee_components_daily" (superseding
+-- v2/sql/060) is a mechanical copy-paste, deliberately left as an
+-- explicit human step rather than auto-generated here, so the full view
+-- text is reviewed once more before being run.
+--
+-- Original (sql/060 v2, lines 193-204) read fee_tax_breakdown_raw on
+-- core.fact_settlement_sku_fee directly:
+--
+--   ('TIKTOK_AFFILIATE_PARTNER_COMMISSION', ...,
+--    (SELECT count(DISTINCT order_id) FROM core.fact_settlement_sku_fee WHERE channel='TIKTOK' AND finance_state='MATCHED' AND fee_tax_breakdown_raw IS NOT NULL AND (fee_tax_breakdown_raw->'fee' ? 'affiliate_partner_commission_amount') AND business_date=e.business_date),
+--    (SELECT sum((fee_tax_breakdown_raw->'fee'->>'affiliate_partner_commission_amount')::numeric) FROM core.fact_settlement_sku_fee WHERE channel='TIKTOK' AND finance_state='MATCHED' AND fee_tax_breakdown_raw IS NOT NULL AND (fee_tax_breakdown_raw->'fee' ? 'affiliate_partner_commission_amount') AND business_date=e.business_date),
+--    ...)
+--
+-- REPLACEMENT (v3, sum from the lossless transaction-grain table instead):
+--
+--   ('TIKTOK_AFFILIATE_PARTNER_COMMISSION', 'TikTok affiliate partner-program commission', 'CM2', 'fee_tax_breakdown.fee.affiliate_partner_commission_amount',
+--    (SELECT count(DISTINCT order_id) FROM core.fact_settlement_sku_transaction WHERE channel='TIKTOK' AND affiliate_partner_commission_amount IS NOT NULL AND business_date=e.business_date),
+--    (SELECT sum(affiliate_partner_commission_amount) FROM core.fact_settlement_sku_transaction WHERE channel='TIKTOK' AND affiliate_partner_commission_amount IS NOT NULL AND business_date=e.business_date),
+--    (SELECT max(source_updated_at) FROM core.fact_settlement_sku_transaction WHERE channel='TIKTOK' AND affiliate_partner_commission_amount IS NOT NULL AND business_date=e.business_date)),
+--   ('TIKTOK_TAP_SHOP_ADS_COMMISSION', 'TikTok Shop Ads commission', 'CM2', 'fee_tax_breakdown.fee.tap_shop_ads_commission',
+--    (SELECT count(DISTINCT order_id) FROM core.fact_settlement_sku_transaction WHERE channel='TIKTOK' AND tap_shop_ads_commission_amount IS NOT NULL AND business_date=e.business_date),
+--    (SELECT sum(tap_shop_ads_commission_amount) FROM core.fact_settlement_sku_transaction WHERE channel='TIKTOK' AND tap_shop_ads_commission_amount IS NOT NULL AND business_date=e.business_date),
+--    (SELECT max(source_updated_at) FROM core.fact_settlement_sku_transaction WHERE channel='TIKTOK' AND tap_shop_ads_commission_amount IS NOT NULL AND business_date=e.business_date)),
+--
+-- NOTE: `finance_state='MATCHED'` filter dropped in the replacement --
+-- fact_settlement_sku_transaction has no finance_state column (that is
+-- an fact_settlement_sku_fee-level concept describing the aggregate
+-- row's settlement status, not a per-transaction-entry concept). If the
+-- filter's intent needs preserving, join back to
+-- fact_settlement_sku_fee on (channel,shop_id,order_id,sku_id) and
+-- filter there instead -- flagged as a decision for whoever composes
+-- the real v3, not resolved silently here.
+--
+-- DEPENDS ON: sql/061 (core.fact_settlement_sku_transaction) existing
+-- AND being populated by the updated write path -- applying this before
+-- either of those would just make these 2 fee_codes report 0/NULL
+-- (table not yet populated), not wrong-but-nonzero data, per the
+-- existing MISSING_SOURCE coverage_status semantics -- fails safe, but
+-- still sequence sql/061 + write-path deploy BEFORE this file.
+-- =====================================================================

@@ -1,85 +1,39 @@
 -- =====================================================================
--- 060_STAGED_canonical_fee_components_view_v2.sql
--- STATUS: SUPERSEDED_BY_063 (2026-09-21) — do not apply this revision.
--- Use sql/063_STAGED_canonical_fee_components_view_v3.sql instead, which
--- is identical to this file except for 2 of 8 TikTok fee_codes
--- (TIKTOK_AFFILIATE_PARTNER_COMMISSION, TIKTOK_TAP_SHOP_ADS_COMMISSION),
--- which now read core.fact_settlement_sku_transaction (sql/061) instead
--- of fee_tax_breakdown_raw here, to inherit the Gate 5 multi-transaction
--- fix. Kept for audit history only.
+-- 063_STAGED_canonical_fee_components_view_v3.sql
 -- STATUS: STAGED / NOT APPLIED to production — rehearsal-branch only.
--- REVISION 4 (Phase 6C — canonical coverage semantics correction).
+-- REVISION 5 (Phase 6C, 2026-09-21) — supersedes sql/060 (revision 4).
+--   060 = SUPERSEDED_BY_063
+--   062 = INCORPORATED_INTO_063 (062 was a diff-only addendum; this file
+--         is the full, directly-executable view it described)
 --
--- BUG FIXED (proven live on rehearsal this pass): revision 3
--- (058_STAGED) computed ONE shared "completeness_status" per TikTok
--- business_date from ORDER-LEVEL core.fact_settlement.settlement_type=
--- 'MATCHED', then applied that SAME status to all 8 Finance-sourced
--- fee_codes regardless of which table/field each fee_code's own value
--- actually comes from. Proven wrong two ways:
---   (a) 127 rows across 34 dates (2026-03-01..08-31) showed
---       coverage_status='READY' with observed_amount=NULL — order-level
---       settlement was MATCHED but the SKU-level fee data (a DIFFERENT
---       table/ingestion path, core.fact_settlement_sku_fee) never
---       existed for those orders at all, or (for 3 newer CM2 fee_codes)
---       the underlying RAW JSONB was never captured pre-2026-09-01.
---   (b) 184 rows across 23 dates showed coverage_ratio=1 while
---       source_orders was NULL or less than eligible_orders — same root
---       cause, coverage_ratio was inherited from the shared CTE instead
---       of being computed from each fee_code's own source population.
+-- CHANGE FROM REVISION 4 (sql/060): exactly 2 of 8 TikTok Finance-domain
+-- fee_codes — TIKTOK_AFFILIATE_PARTNER_COMMISSION and
+-- TIKTOK_TAP_SHOP_ADS_COMMISSION — now read from
+-- core.fact_settlement_sku_transaction (sql/061, the lossless
+-- transaction-grain table) instead of fee_tax_breakdown_raw on
+-- core.fact_settlement_sku_fee. Root cause: TikTok can return multiple
+-- sku_transaction entries sharing one (order_id, sku_id) (proven live,
+-- order 585474165265106454); fact_settlement_sku_fee's raw column can
+-- only hold ONE representative entry post-aggregation, so summing raw
+-- off that table for these 2 fee_codes would silently undercount the
+-- exact same way the pre-fix revenue/shipping totals did. The other 6
+-- fee_codes read fact_settlement_sku_fee's STRUCTURED columns, which
+-- are now written by summing every row in fact_settlement_sku_transaction
+-- for that (order_id,sku_id) — no SQL text change needed for those 6,
+-- they inherit the fix once the write path (incr_worker.py) is deployed.
 --
--- FIX: coverage is now computed PER fee_code, from that fee_code's own
--- authoritative source:
---   - The 5 base CM1/CM2 fee_codes (platform_commission, transaction/
---     payment_fee, vxp_fee, infrastructure_fee, affiliate_commission)
---     read core.fact_settlement_sku_fee's own structured columns
---     directly — those columns are populated at ingestion time
---     regardless of raw JSONB retention, so "source_orders" = distinct
---     orders with a MATCHED sku_fee row where that column IS NOT NULL.
---   - The 3 newer CM2 fee_codes (affiliate_ads_commission,
---     affiliate_partner_commission, tap_shop_ads_commission) are ONLY
---     ever populated FROM fee_tax_breakdown_raw (proven live this
---     session: 0 rows have these structured values populated when raw
---     is NULL) — "source_orders" = distinct orders with a MATCHED
---     sku_fee row where fee_tax_breakdown_raw IS NOT NULL AND the
---     specific key is present in fee_tax_breakdown_raw->'fee' (also
---     proven live: whenever raw is present, all 3 keys are always
---     present, explicit zero when not applicable — 0 absent-key rows
---     found across the full TIKTOK population).
+-- DEPENDS ON: sql/061 existing AND being populated by the updated write
+-- path. Applying this before either exists just makes these 2 fee_codes
+-- report 0/NULL (MISSING_SOURCE), not wrong-but-nonzero data — fails
+-- safe, but sequence sql/061 + write-path deploy BEFORE this file.
 --
--- Field-present-with-explicit-zero COUNTS as observed (never treated as
--- missing); field genuinely absent does NOT count. observed_amount is
--- NULL only when source_orders=0 for that fee_code on that date (truly
--- nothing observed) — never fabricated as 0 in that case, and never
--- left NULL when source_orders>0 and every observed value happens to be
--- an explicit zero (SQL SUM() over a non-empty explicit-zero set
--- returns 0, not NULL, with no special-casing needed).
---
--- RECOVERABILITY (Phase 6C Section 2/3): a live, read-only, per-order
--- probe this session (GET /finance/202501/orders/{order_id}/
--- statement_transactions) against three real historical orders --
--- including order 582847443846137818, business_date 2026-03-01, the
--- OLDEST date with any TikTok Finance data in this shop's history --
--- proved TikTok's API STILL RETURNS full fee_tax_breakdown,
--- revenue_breakdown, AND shipping_cost_breakdown for that order TODAY.
--- This is Option B (recoverable by API re-fetch), NOT Option C. The
--- current-state gap below is therefore classified MISSING_SOURCE (data
--- genuinely absent from CORE right now), never HISTORICAL_SOURCE_LIMITED
--- (which this session reserves for a proven-unrecoverable case, which
--- this is not) and never READY. A backfill PLAN (not execution) is
--- documented separately in TIKTOK_HISTORICAL_RAW_BACKFILL_PLAN.csv,
--- per the explicit "build a backfill plan only" instruction.
---
--- Threshold: RAW_CAPTURE_START_DATE = 2026-09-01 (earliest date with any
--- fee_tax_breakdown_raw IS NOT NULL row in core.fact_settlement_sku_fee,
--- confirmed live this session). Used only as descriptive metadata below
--- (basis label), not to gate coverage_status — coverage_status is
--- driven purely by each fee_code's own source_orders/eligible_orders
--- ratio, per the instruction that coverage must be fee-source-specific
--- and never a date-threshold shortcut.
+-- Everything below revision 4's original header/body is otherwise
+-- UNCHANGED — see sql/060 for the full original rationale (058→060 bug
+-- fix history, coverage-status semantics, RAW_CAPTURE_START_DATE note).
 -- =====================================================================
 CREATE OR REPLACE VIEW mart.v_ai_fee_components_daily AS
 
--- ---- SHOPEE — unchanged from revision 3 (not in scope for this fix;
+-- ---- SHOPEE — unchanged from revision 4 (not in scope for this fix;
 --      no per-order Finance-eligibility gate exists for this channel). ----
 SELECT business_date, channel, 'SHOPEE_FIXED_COMMISSION' AS fee_code,
        'Shopee fixed commission' AS fee_name, 'CM1' AS economic_layer,
@@ -119,7 +73,7 @@ SELECT business_date, channel, 'SHOPEE_CANCEL_RETURN_LOGISTICS_NET', 'Shopee can
 FROM mart.v_ceo_ecom_daily WHERE channel = 'SHOPEE'
 -- (No SHOPEE_VOUCHER_XTRA or SHOPEE_INFRASTRUCTURE branch -- both
 -- intentionally absent; business-owner-confirmed included in
--- SHOPEE_SERVICE_FEE above. Unchanged from revision 3.)
+-- SHOPEE_SERVICE_FEE above. Unchanged from revision 4.)
 UNION ALL
 SELECT business_date, channel, 'SHOPEE_AFFILIATE_AMS', 'Shopee affiliate commission (AMS, order-level precedence)', 'CM2',
        'API_ACTUAL', 'ams/get_conversion_report + settlement order_ams_commission_fee', 'affiliate_commission',
@@ -194,21 +148,28 @@ CROSS JOIN LATERAL (
      (SELECT count(DISTINCT order_id) FROM core.fact_settlement_sku_fee WHERE channel='TIKTOK' AND finance_state='MATCHED' AND affiliate_fee IS NOT NULL AND business_date=e.business_date),
      (SELECT sum(affiliate_fee) FROM core.fact_settlement_sku_fee WHERE channel='TIKTOK' AND finance_state='MATCHED' AND affiliate_fee IS NOT NULL AND business_date=e.business_date),
      (SELECT max(source_updated_at) FROM core.fact_settlement_sku_fee WHERE channel='TIKTOK' AND finance_state='MATCHED' AND affiliate_fee IS NOT NULL AND business_date=e.business_date)),
-    -- ---- 3 newer CM2 components: authoritative source = raw JSONB ONLY
-    --      (proven live: structured column never populated without raw;
-    --      key always present-with-explicit-zero when raw is present). ----
+    -- ---- 3 newer CM2 components: TIKTOK_AFFILIATE_ADS_COMMISSION keeps
+    --      reading fact_settlement_sku_fee's raw column (unaffected --
+    --      affiliate_ads_commission_amount has been a named STRUCTURED
+    --      column since sql/054, not raw-only, so it already inherits
+    --      the write-path fix like the base 5 above). The other 2 below
+    --      are the ones changed in this revision. ----
     ('TIKTOK_AFFILIATE_ADS_COMMISSION', 'TikTok affiliate ads commission (paid boost)', 'CM2', 'fee_tax_breakdown.fee.affiliate_ads_commission_amount',
-     (SELECT count(DISTINCT order_id) FROM core.fact_settlement_sku_fee WHERE channel='TIKTOK' AND finance_state='MATCHED' AND fee_tax_breakdown_raw IS NOT NULL AND (fee_tax_breakdown_raw->'fee' ? 'affiliate_ads_commission_amount') AND business_date=e.business_date),
-     (SELECT sum((fee_tax_breakdown_raw->'fee'->>'affiliate_ads_commission_amount')::numeric) FROM core.fact_settlement_sku_fee WHERE channel='TIKTOK' AND finance_state='MATCHED' AND fee_tax_breakdown_raw IS NOT NULL AND (fee_tax_breakdown_raw->'fee' ? 'affiliate_ads_commission_amount') AND business_date=e.business_date),
-     (SELECT max(source_updated_at) FROM core.fact_settlement_sku_fee WHERE channel='TIKTOK' AND finance_state='MATCHED' AND fee_tax_breakdown_raw IS NOT NULL AND (fee_tax_breakdown_raw->'fee' ? 'affiliate_ads_commission_amount') AND business_date=e.business_date)),
+     (SELECT count(DISTINCT order_id) FROM core.fact_settlement_sku_fee WHERE channel='TIKTOK' AND finance_state='MATCHED' AND affiliate_ads_commission_amount IS NOT NULL AND business_date=e.business_date),
+     (SELECT sum(affiliate_ads_commission_amount) FROM core.fact_settlement_sku_fee WHERE channel='TIKTOK' AND finance_state='MATCHED' AND affiliate_ads_commission_amount IS NOT NULL AND business_date=e.business_date),
+     (SELECT max(source_updated_at) FROM core.fact_settlement_sku_fee WHERE channel='TIKTOK' AND finance_state='MATCHED' AND affiliate_ads_commission_amount IS NOT NULL AND business_date=e.business_date)),
+    -- REVISION 5 CHANGE: read from the lossless transaction-grain table
+    -- (sql/061), not fee_tax_breakdown_raw on fact_settlement_sku_fee --
+    -- see this file's header. source_orders/observed_amount now sum
+    -- across every source transaction, never just the last-surviving one.
     ('TIKTOK_AFFILIATE_PARTNER_COMMISSION', 'TikTok affiliate partner-program commission', 'CM2', 'fee_tax_breakdown.fee.affiliate_partner_commission_amount',
-     (SELECT count(DISTINCT order_id) FROM core.fact_settlement_sku_fee WHERE channel='TIKTOK' AND finance_state='MATCHED' AND fee_tax_breakdown_raw IS NOT NULL AND (fee_tax_breakdown_raw->'fee' ? 'affiliate_partner_commission_amount') AND business_date=e.business_date),
-     (SELECT sum((fee_tax_breakdown_raw->'fee'->>'affiliate_partner_commission_amount')::numeric) FROM core.fact_settlement_sku_fee WHERE channel='TIKTOK' AND finance_state='MATCHED' AND fee_tax_breakdown_raw IS NOT NULL AND (fee_tax_breakdown_raw->'fee' ? 'affiliate_partner_commission_amount') AND business_date=e.business_date),
-     (SELECT max(source_updated_at) FROM core.fact_settlement_sku_fee WHERE channel='TIKTOK' AND finance_state='MATCHED' AND fee_tax_breakdown_raw IS NOT NULL AND (fee_tax_breakdown_raw->'fee' ? 'affiliate_partner_commission_amount') AND business_date=e.business_date)),
+     (SELECT count(DISTINCT order_id) FROM core.fact_settlement_sku_transaction WHERE channel='TIKTOK' AND affiliate_partner_commission_amount IS NOT NULL AND business_date=e.business_date),
+     (SELECT sum(affiliate_partner_commission_amount) FROM core.fact_settlement_sku_transaction WHERE channel='TIKTOK' AND affiliate_partner_commission_amount IS NOT NULL AND business_date=e.business_date),
+     (SELECT max(source_updated_at) FROM core.fact_settlement_sku_transaction WHERE channel='TIKTOK' AND affiliate_partner_commission_amount IS NOT NULL AND business_date=e.business_date)),
     ('TIKTOK_TAP_SHOP_ADS_COMMISSION', 'TikTok Shop Ads commission', 'CM2', 'fee_tax_breakdown.fee.tap_shop_ads_commission',
-     (SELECT count(DISTINCT order_id) FROM core.fact_settlement_sku_fee WHERE channel='TIKTOK' AND finance_state='MATCHED' AND fee_tax_breakdown_raw IS NOT NULL AND (fee_tax_breakdown_raw->'fee' ? 'tap_shop_ads_commission') AND business_date=e.business_date),
-     (SELECT sum((fee_tax_breakdown_raw->'fee'->>'tap_shop_ads_commission')::numeric) FROM core.fact_settlement_sku_fee WHERE channel='TIKTOK' AND finance_state='MATCHED' AND fee_tax_breakdown_raw IS NOT NULL AND (fee_tax_breakdown_raw->'fee' ? 'tap_shop_ads_commission') AND business_date=e.business_date),
-     (SELECT max(source_updated_at) FROM core.fact_settlement_sku_fee WHERE channel='TIKTOK' AND finance_state='MATCHED' AND fee_tax_breakdown_raw IS NOT NULL AND (fee_tax_breakdown_raw->'fee' ? 'tap_shop_ads_commission') AND business_date=e.business_date))
+     (SELECT count(DISTINCT order_id) FROM core.fact_settlement_sku_transaction WHERE channel='TIKTOK' AND tap_shop_ads_commission_amount IS NOT NULL AND business_date=e.business_date),
+     (SELECT sum(tap_shop_ads_commission_amount) FROM core.fact_settlement_sku_transaction WHERE channel='TIKTOK' AND tap_shop_ads_commission_amount IS NOT NULL AND business_date=e.business_date),
+     (SELECT max(source_updated_at) FROM core.fact_settlement_sku_transaction WHERE channel='TIKTOK' AND tap_shop_ads_commission_amount IS NOT NULL AND business_date=e.business_date))
 ) AS raw_x(fee_code, fee_name, economic_layer, source_field, source_orders, observed_amount, last_source_date)
 CROSS JOIN LATERAL (
     SELECT raw_x.fee_code, raw_x.fee_name, raw_x.economic_layer, raw_x.source_field,

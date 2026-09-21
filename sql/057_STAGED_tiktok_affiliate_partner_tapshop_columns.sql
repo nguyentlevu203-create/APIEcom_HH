@@ -2,6 +2,18 @@
 -- 057_STAGED_tiktok_affiliate_partner_tapshop_columns.sql
 -- STATUS: STAGED / NOT APPLIED — pending human approval.
 --
+-- DEPENDENCY (added 2026-09-21, Phase 6C Task F): the ADD COLUMN below
+-- is still independently safe/necessary (additive, no data yet). BUT
+-- the backfill statement further down must NOT run using its original
+-- single-table form until sql/061 (core.fact_settlement_sku_transaction)
+-- exists AND is populated by the updated write path — doing so earlier
+-- would silently write undercounted values for any (order_id,sku_id)
+-- that hit the multi-transaction collision, creating data that LOOKS
+-- populated but is wrong, which is worse than leaving it NULL
+-- (MISSING_SOURCE is a safe, honest state; a wrong nonzero is not).
+-- Sequence: sql/061 + incr_worker.py write-path deploy -> THEN this
+-- file's (updated) backfill statement -> THEN sql/063.
+--
 -- P8.7 fee standardization — promotes two of the three previously
 -- JSONB-only-captured TikTok affiliate/ads fee sub-fields to named,
 -- indexed columns, per Section H.2's requirement to "giữ component
@@ -30,9 +42,30 @@ ALTER TABLE core.fact_settlement_sku_fee
     ADD COLUMN IF NOT EXISTS affiliate_partner_commission_amount NUMERIC(18,4),
     ADD COLUMN IF NOT EXISTS tap_shop_ads_commission_amount NUMERIC(18,4);
 
--- Backfill statement (idempotent, run once the column exists; values
--- already sit in fee_tax_breakdown_raw from the P8.6 backfill, so this
--- needs NO new live API calls — pure in-database extraction):
+-- Backfill statement — UPDATED 2026-09-21 (Phase 6C Task C): the
+-- statement below (reading fee_tax_breakdown_raw directly off
+-- fact_settlement_sku_fee) is STILL CORRECT ONLY for orders that never
+-- hit the multi-transaction-per-sku_id collision (see sql/061) — for a
+-- collided (order_id, sku_id), fee_tax_breakdown_raw on this table
+-- reflects just one surviving entry, understating the true value the
+-- same way the pre-fix revenue/shipping totals did. Once sql/061 (the
+-- lossless transaction-grain table) exists and is populated, prefer:
+--
+-- UPDATE core.fact_settlement_sku_fee f
+-- SET affiliate_partner_commission_amount = t.partner_sum,
+--     tap_shop_ads_commission_amount = t.tapshop_sum
+-- FROM (
+--     SELECT order_id, sku_id,
+--            sum(affiliate_partner_commission_amount) AS partner_sum,
+--            sum(tap_shop_ads_commission_amount) AS tapshop_sum
+--     FROM core.fact_settlement_sku_transaction
+--     WHERE channel='TIKTOK'
+--     GROUP BY order_id, sku_id
+-- ) t
+-- WHERE f.channel='TIKTOK' AND f.order_id=t.order_id AND f.sku_id=t.sku_id;
+--
+-- The original single-table statement is kept below for reference /
+-- for use only if sql/061 is deliberately not adopted:
 --
 -- UPDATE core.fact_settlement_sku_fee
 -- SET affiliate_partner_commission_amount = (fee_tax_breakdown_raw->'fee'->>'affiliate_partner_commission_amount')::numeric,
