@@ -1,78 +1,143 @@
 # P3 — V0 scheduled incremental ingestion (Shopee + TikTok).
 #
-# PREPARED, NOT ENABLED. This working root is not currently a git
-# repository (`git status` returns "fatal: not a git repository") and
-# has no GitHub remote/Actions context to verify credentials, secrets,
-# or runner access against — per the P3 instructions ("prepare, not
-# blindly enable... do NOT enable/push/start continuous scheduling if
-# repository/authentication context is not fully verified... do not
-# create a new repository automatically"), this file is written to disk
-# ready to use, but nothing has been pushed, no repository was
-# initialized, and no schedule is currently running anywhere.
+# PHASE 6C UPDATE (2026-09-21, LOCAL ONLY — NOT ENABLED, NOT PUSHED):
+# this repo now HAS a GitHub remote (github.com/nguyentlevu203-create/
+# APIEcom_HH.git) — the original blocker #1 below no longer applies.
+# Blockers #2 (credential abstraction) and #3 (token provisioning) are
+# addressed by this revision's env-var precedence in incr_common.py /
+# shopee/keychain.py / tiktok_shop/keychain.py (env var wins when
+# present, macOS Keychain fallback unchanged for local/Mac use) and by
+# the token-provisioning steps added below. `schedule:` stays commented
+# out — a human must review this file in its actual repo context, add
+# the GitHub Secrets listed below, and uncomment it before it ever runs
+# unattended. This file itself makes no such decision.
 #
-# Before this can actually run on a schedule, a human needs to:
-#   1. `git init` this directory (or move it into an existing repo) and
-#      push it to GitHub — a deliberate decision this session does not
-#      make automatically.
-#   2. Add repository secrets equivalent to what this session reads
-#      from the local macOS Keychain (HH_ECOM_NEON/hh_etl_writer_database_url,
-#      the TikTok App Secret, the Shopee Partner Key) — GitHub Actions
-#      runners have no access to this machine's Keychain, so
-#      keyring.get_password() calls in incr_common.py / keychain.py /
-#      tiktok_shop/keychain.py would need an env-var-backed fallback
-#      that does not exist yet. That adaptation is explicitly OUT of
-#      P3's scope (Section 14 only requires reusing EXISTING secure
-#      credential storage) and is called out here, not silently
-#      papered over.
-#   3. Confirm tokens.json / shop_info.json for TikTok (currently local,
-#      git-ignored files) are provisioned on the runner some other way.
+# Runs the REAL production entrypoint (scripts/run_production_cycle.py —
+# incremental CORE, then GOLD, then reconciliation, then a production
+# health check, in that order, per that script's own docstring) rather
+# than pipelines/incremental.py alone, matching what the (currently
+# broken) macOS LaunchAgent was supposed to run.
+#
+# Required GitHub Secrets (create these in the repo's Settings before
+# ever uncommenting `schedule:` — names only, no values here):
+#   HH_ETL_WRITER_DATABASE_URL      (Neon hh_etl_writer role connection string)
+#   HH_NEONDB_OWNER_DATABASE_URL    (Neon neondb_owner role — read-only usage
+#                                     in this workflow: healthcheck + source-
+#                                     coverage snapshot only, never DDL)
+#   SHOPEE_LIVE_PARTNER_KEY
+#   SHOPEE_ACCESS_TOKEN
+#   SHOPEE_REFRESH_TOKEN
+#   SHOPEE_SHOP_ID
+#   SHOPEE_PARTNER_ID
+#   SHOPEE_ACCESS_TOKEN_EXPIRE_AT
+#   SHOPEE_REFRESH_TOKEN_EXPIRE_AT
+#   TIKTOK_APP_SECRET
+#   TIKTOK_TOKENS_JSON        (full JSON content of tokens.json)
+#   TIKTOK_SHOP_INFO_JSON     (full JSON content of shop_info.json)
 #
 # Cron timezone note (verified, not assumed): GitHub Actions `schedule`
-# events run in UTC ONLY — there is no timezone field. The requested
-# cadence is "17 and 47 minutes past every hour, Asia/Ho_Chi_Minh".
-# Vietnam is UTC+7 with no daylight-saving offset (a whole-hour,
-# constant offset) — shifting a timestamp by a whole number of hours
-# changes only its HOUR field, never its MINUTE field. Since this
-# schedule fires on every hour (not a specific hour-of-day), the literal
-# cron expression "17,47 * * * *" already fires at :17/:47 in BOTH UTC
-# and Asia/Ho_Chi_Minh simultaneously — no conversion is needed or
-# possible to get "more correct" here. This is the verified, correct
-# expression, not a placeholder.
+# events run in UTC ONLY. Business cadence (from the disabled macOS
+# LaunchAgent plist, com.hh.ecom.production.cycle.plist) is 06:00 and
+# 18:00 Asia/Ho_Chi_Minh (UTC+7, no daylight saving, constant offset):
+#   06:00 ICT - 7h = 23:00 UTC (previous day)  -> cron "0 23 * * *"
+#   18:00 ICT - 7h = 11:00 UTC (same day)      -> cron "0 11 * * *"
 
 name: P3 Incremental Ingestion (Shopee + TikTok)
 
 on:
-  # DISABLED on purpose — see header. Uncomment once steps 1-3 above are
-  # done and a human has reviewed this file in its actual repo context.
+  # DISABLED on purpose — see header. Uncomment only after every secret
+  # above exists in this repo's Settings and a human has reviewed this
+  # file in its actual repo context (Task E: only after a controlled
+  # manual catch-up has PASSed).
   # schedule:
-  #   - cron: "17,47 * * * *"
+  #   - cron: "0 23 * * *"   # 06:00 Asia/Ho_Chi_Minh
+  #   - cron: "0 11 * * *"   # 18:00 Asia/Ho_Chi_Minh
   workflow_dispatch: {}   # manual trigger only, for now
+
+concurrency:
+  # Same intent as run_production_cycle.py's own fcntl single-instance
+  # lock (still in effect within one runner) — this additionally stops
+  # a second GitHub-triggered run from starting while one is still in
+  # flight (e.g. a manual dispatch overlapping a scheduled fire), so two
+  # cycles never race each other against the same production database.
+  group: p3-incremental-production-cycle
+  cancel-in-progress: false
 
 jobs:
   incremental:
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    env:
+      TZ: UTC
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/setup-python@v5
         with:
+          # NOTE (portability audit, D1): local production Mac currently
+          # runs Python 3.14 (confirmed live via scripts/production_
+          # healthcheck.py's interpreter). This workflow pins 3.11
+          # (matches the original P3 draft and integrations/tiktok_shop/
+          # requirements.txt, which has no upper bound) — flagged, not
+          # silently resolved, since nothing in the codebase has been
+          # verified 3.14-specific, but a human should confirm before
+          # first real run.
           python-version: "3.11"
 
       - name: Install dependencies
-        # integrations/shopee/ has no requirements.txt (verified before
-        # writing this file) — installing the actual runtime deps this
-        # pipeline imports directly instead of inventing a path.
         run: |
           pip install -r integrations/tiktok_shop/requirements.txt
           pip install psycopg2-binary keyring requests
 
-      - name: Run incremental ingestion
-        # NOTE: as written, this step will fail on a hosted runner —
-        # keyring has no macOS Keychain to read from in this environment.
-        # See header note (2): a Keychain-vs-env-var credential source
-        # abstraction is required before this can actually execute here.
-        # Left as-is deliberately rather than silently working around it.
-        run: python3 pipelines/incremental.py
+      - name: Provision TikTok tokens (from secrets, never committed)
+        # token_store.py reads these via a plain relative path
+        # (integrations/tiktok_shop/{tokens,shop_info}.json) — no code
+        # change needed there, just write the secret content to that
+        # same path at runtime. Restrictive permissions match what
+        # authorize.py itself sets locally (0600).
+        run: |
+          umask 077
+          printf '%s' "$TIKTOK_TOKENS_JSON" > integrations/tiktok_shop/tokens.json
+          printf '%s' "$TIKTOK_SHOP_INFO_JSON" > integrations/tiktok_shop/shop_info.json
+          chmod 600 integrations/tiktok_shop/tokens.json integrations/tiktok_shop/shop_info.json
         env:
-          TZ: UTC
+          TIKTOK_TOKENS_JSON: ${{ secrets.TIKTOK_TOKENS_JSON }}
+          TIKTOK_SHOP_INFO_JSON: ${{ secrets.TIKTOK_SHOP_INFO_JSON }}
+
+      - name: Run production cycle (CORE -> GOLD -> reconcile -> healthcheck)
+        run: python3 scripts/run_production_cycle.py
+        env:
+          HH_ETL_WRITER_DATABASE_URL: ${{ secrets.HH_ETL_WRITER_DATABASE_URL }}
+          HH_NEONDB_OWNER_DATABASE_URL: ${{ secrets.HH_NEONDB_OWNER_DATABASE_URL }}
+          SHOPEE_LIVE_PARTNER_KEY: ${{ secrets.SHOPEE_LIVE_PARTNER_KEY }}
+          SHOPEE_ACCESS_TOKEN: ${{ secrets.SHOPEE_ACCESS_TOKEN }}
+          SHOPEE_REFRESH_TOKEN: ${{ secrets.SHOPEE_REFRESH_TOKEN }}
+          SHOPEE_SHOP_ID: ${{ secrets.SHOPEE_SHOP_ID }}
+          SHOPEE_PARTNER_ID: ${{ secrets.SHOPEE_PARTNER_ID }}
+          SHOPEE_ACCESS_TOKEN_EXPIRE_AT: ${{ secrets.SHOPEE_ACCESS_TOKEN_EXPIRE_AT }}
+          SHOPEE_REFRESH_TOKEN_EXPIRE_AT: ${{ secrets.SHOPEE_REFRESH_TOKEN_EXPIRE_AT }}
+          TIKTOK_APP_SECRET: ${{ secrets.TIKTOK_APP_SECRET }}
+
+      - name: Clean up provisioned token files
+        # Belt-and-suspenders: GitHub-hosted runners are ephemeral VMs
+        # destroyed after the job regardless, but this keeps the same
+        # discipline as authorize.py's "never leave secrets lying around
+        # longer than needed" convention, and matters if this workflow
+        # is ever pointed at a self-hosted/reused runner later.
+        if: always()
+        run: rm -f integrations/tiktok_shop/tokens.json integrations/tiktok_shop/shop_info.json
+
+      - name: Upload cycle logs (observability, D4)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: production-cycle-logs-${{ github.run_id }}
+          path: artifacts/v0/cycle_logs/
+          retention-days: 14
+
+      # D4: workflow failure is visible natively via GitHub's own Actions
+      # UI/notifications (job goes red, org/user gets a notification per
+      # their GitHub notification settings) — no Slack/email integration
+      # exists in this repo today, so none is invented here. Non-zero
+      # exit is already guaranteed by scripts/run_production_cycle.py's
+      # own `sys.exit(main())` (0 on GREEN/YELLOW verdict, 1 on RED).

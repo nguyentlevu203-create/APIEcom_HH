@@ -9,6 +9,7 @@ transiently, in process memory during a request.
 """
 from __future__ import annotations
 
+import os
 from typing import Optional
 
 import keyring
@@ -26,6 +27,13 @@ ACCOUNT_REFRESH_TOKEN_EXPIRE_AT = "REFRESH_TOKEN_EXPIRE_AT"
 
 
 def get_secret(account: str) -> Optional[str]:
+    # Phase 6C scheduler-migration — GitHub Actions runners have no macOS
+    # Keychain. An env var named SHOPEE_<account> (set from a GitHub
+    # Secret) takes precedence when present; unset on the Mac local/
+    # production path, so behavior there is unchanged.
+    env_value = os.environ.get(f"SHOPEE_{account}")
+    if env_value:
+        return env_value
     return keyring.get_password(KEYCHAIN_SERVICE, account)
 
 

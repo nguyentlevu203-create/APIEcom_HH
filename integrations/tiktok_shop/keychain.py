@@ -9,6 +9,7 @@ It lives only in the OS keychain and, transiently, in process memory.
 from __future__ import annotations
 
 import getpass
+import os
 from typing import Optional
 
 import keyring
@@ -17,6 +18,13 @@ from config import KEYCHAIN_SERVICE
 
 
 def get_app_secret(app_key: str) -> Optional[str]:
+    # Phase 6C scheduler-migration — GitHub Actions runners have no macOS
+    # Keychain. TIKTOK_APP_SECRET (set from a GitHub Secret) takes
+    # precedence when present; unset on the Mac local/production path,
+    # so behavior there is unchanged.
+    env_value = os.environ.get("TIKTOK_APP_SECRET")
+    if env_value:
+        return env_value
     return keyring.get_password(KEYCHAIN_SERVICE, app_key)
 
 

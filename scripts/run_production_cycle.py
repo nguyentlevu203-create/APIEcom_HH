@@ -165,7 +165,9 @@ def run_source_coverage_snapshot() -> dict:
     import keyring
     import psycopg2
 
-    url = keyring.get_password("HH_ECOM_NEON", "neondb_owner_database_url")
+    # Phase 6C scheduler-migration — see D2: env var (GitHub Secret) takes
+    # precedence over Keychain; unset on the Mac local/production path.
+    url = os.environ.get("HH_NEONDB_OWNER_DATABASE_URL") or keyring.get_password("HH_ECOM_NEON", "neondb_owner_database_url")
     conn = psycopg2.connect(url)
     del url
     cur = conn.cursor()

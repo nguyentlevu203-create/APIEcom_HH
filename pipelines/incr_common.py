@@ -52,13 +52,20 @@ CADENCE_MINUTES = {
 
 
 def get_db_conn():
-    # Phase 6B rehearsal only: HH_ECOM_DB_URL_OVERRIDE redirects every
-    # write in this process (including finish_run_log's own connection)
-    # to an isolated Neon branch. Unset in the normal/production path,
-    # so default behavior is unchanged — this is the only mechanism by
-    # which rehearsal code is permitted to run without ever touching
-    # the production database.
-    url = os.environ.get("HH_ECOM_DB_URL_OVERRIDE") or keyring.get_password("HH_ECOM_NEON", "hh_etl_writer_database_url")
+    # Phase 6C scheduler-migration — GitHub Actions runners have no macOS
+    # Keychain, so an explicit secret-backed env var takes precedence
+    # when present (set from a GitHub Secret in the workflow; see
+    # .github/workflows/p3-incremental.yml). Unset on the Mac local/
+    # production path, so behavior there is completely unchanged.
+    url = os.environ.get("HH_ETL_WRITER_DATABASE_URL")
+    if not url:
+        # Phase 6B rehearsal only: HH_ECOM_DB_URL_OVERRIDE redirects every
+        # write in this process (including finish_run_log's own connection)
+        # to an isolated Neon branch. Unset in the normal/production path,
+        # so default behavior is unchanged — this is the only mechanism by
+        # which rehearsal code is permitted to run without ever touching
+        # the production database.
+        url = os.environ.get("HH_ECOM_DB_URL_OVERRIDE") or keyring.get_password("HH_ECOM_NEON", "hh_etl_writer_database_url")
     if not url:
         raise RuntimeError("hh_etl_writer_database_url missing from Keychain")
     conn = psycopg2.connect(
