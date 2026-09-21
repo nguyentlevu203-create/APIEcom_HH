@@ -400,3 +400,54 @@ def aggregate_tiktok_finance_skus(tx_list: list) -> dict:
         "shipping_cost_breakdown_raw": [n["shipping_cost_breakdown_raw"] for n in normed],
         "n_transactions": len(tx_list),
     }
+
+
+def decide_settlement_write(existing: Optional[dict], incoming_status: str) -> str:
+    """Phase 6C P4-bis (2026-09-21) — TRANSIENT_SETTLEMENT_REGRESSION guard
+    for core.fact_settlement's order-level write in
+    incr_worker.py::run_finance.
+
+    Proven live: order 586086803325813933 had a confirmed-good row
+    (settlement_type='MATCHED', settlement_amount=134669) silently
+    overwritten with ('UNKNOWN', NULL) by a single API call that
+    returned a non-2xx-but-non-retried response (ic.with_backoff only
+    retries on Timeout/ConnectionError/TransientHTTPError exceptions —
+    this failure mode didn't raise one, so it was never retried). An
+    immediate live re-fetch afterward proved the source itself never
+    stopped having real MATCHED data — only that one API call glitched.
+
+    `existing`: {'settlement_type': str, 'settlement_amount': Decimal|None}
+    for the CURRENT DB row, or None if no row exists yet for this order.
+    `incoming_status`: the status this write attempt just computed
+    ('MATCHED', 'NOT_SETTLED_YET', or 'UNKNOWN').
+
+    Returns:
+      'WRITE' — proceed with the write as computed. Always returned for
+        a fresh MATCHED result (Case 1 — always trust real data), and
+        for ANY status when there is no confirmed-good existing row to
+        protect (Case 3 — nothing to lose, write as computed; this
+        includes the ordinary NOT_SETTLED_YET->MATCHED progression).
+      'RETRY' — existing row is confirmed-good (MATCHED with a non-null
+        settlement_amount) and the incoming status would regress it
+        (Case 2). Caller must re-fetch once before deciding further; if
+        the retry is still not MATCHED, PRESERVE the existing row
+        (skip the write entirely) and log a DQ warning — never
+        overwrite a proven-good value with an unproven worse one.
+
+    Deliberately covers BOTH incoming=UNKNOWN and incoming=NOT_SETTLED_YET
+    as retry-worthy regressions (not just the exact UNKNOWN case observed
+    live) — the risk (losing confirmed-good data to an unproven fetch) is
+    identical either way, and this is still entirely within the
+    TikTok order-level settlement write path, not a scope expansion.
+    No case here assumes a documented legitimate MATCHED->earlier-status
+    reversal exists (Case 4) — none has been proven, so none is
+    special-cased; if TikTok's contract is later shown to allow that,
+    this function needs a new, evidenced case, not a guess."""
+    if incoming_status == "MATCHED":
+        return "WRITE"
+    existing_confirmed_good = (
+        existing is not None
+        and existing.get("settlement_type") == "MATCHED"
+        and existing.get("settlement_amount") is not None
+    )
+    return "RETRY" if existing_confirmed_good else "WRITE"

@@ -31,6 +31,7 @@ import incr_common as ic  # noqa: E402
 from canonical_normalizer import (  # noqa: E402
     normalize_tiktok_finance_sku, aggregate_tiktok_finance_skus,
     assign_occurrence_indices, audit_unknown_nonzero_components,
+    decide_settlement_write,
     TIKTOK_SHIPPING_FORMULA_FIELDS, TIKTOK_SHIPPING_KNOWN_ALWAYS_ZERO_FIELDS,
     TIKTOK_SHIPPING_KNOWN_NESTED_FIELDS, TIKTOK_REVENUE_FORMULA_FIELDS,
     TIKTOK_REVENUE_KNOWN_ALWAYS_ZERO_FIELDS, TIKTOK_REVENUE_KNOWN_NESTED_FIELDS,
@@ -229,6 +230,36 @@ def run_finance(cur, etl_run_id, shop_id, window_start, window_end, log) -> dict
             )
         resp = ic.with_backoff(call, f"tiktok finance {oid}", log)
         has_real = resp.ok and bool(resp.data.get("sku_transactions"))
+
+        # Phase 6C P4-bis — TRANSIENT_SETTLEMENT_REGRESSION guard. Proven
+        # live: ic.with_backoff() only retries on Timeout/ConnectionError/
+        # TransientHTTPError exceptions; a "not ok" response that doesn't
+        # raise one of those (as happened for order 586086803325813933)
+        # passes straight through, unretried, and the unconditional UPSERT
+        # below would silently overwrite a confirmed-good MATCHED row with
+        # UNKNOWN/NULL. Check BEFORE deciding anything only when this
+        # result would NOT be a fresh MATCHED (decide_settlement_write
+        # short-circuits to WRITE immediately for MATCHED, so this costs
+        # nothing on the common path).
+        if not has_real:
+            cur.execute(
+                "SELECT settlement_type, settlement_amount FROM core.fact_settlement "
+                "WHERE channel='TIKTOK' AND shop_id=%s AND settlement_id=%s;",
+                (shop_id, oid),
+            )
+            existing_row = cur.fetchone()
+            existing = {"settlement_type": existing_row[0], "settlement_amount": existing_row[1]} if existing_row else None
+            if decide_settlement_write(existing, "UNKNOWN" if not resp.ok else "NOT_SETTLED_YET") == "RETRY":
+                resp = ic.with_backoff(call, f"tiktok finance RETRY {oid}", log)
+                has_real = resp.ok and bool(resp.data.get("sku_transactions"))
+                if not has_real:
+                    retry_status = "UNKNOWN" if not resp.ok else "NOT_SETTLED_YET"
+                    log(f"DQ_WARNING TRANSIENT_SETTLEMENT_REGRESSION order={oid} "
+                        f"existing_type={existing['settlement_type']} existing_amount={existing['settlement_amount']} "
+                        f"retry_status={retry_status} -- PRESERVING existing value, skipping write this cycle")
+                    time.sleep(0.12)
+                    continue  # preserve existing row untouched -- no write for this order this cycle
+
         if has_real:
             d = resp.data
             status, settlement_amount = "MATCHED", ic.dec(d.get("settlement_amount"))

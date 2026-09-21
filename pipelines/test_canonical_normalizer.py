@@ -19,6 +19,7 @@ from canonical_normalizer import (
     audit_unknown_nonzero_components,
     transaction_content_hash,
     assign_occurrence_indices,
+    decide_settlement_write,
     TIKTOK_SHIPPING_FORMULA_FIELDS,
     TIKTOK_SHIPPING_KNOWN_ALWAYS_ZERO_FIELDS,
     TIKTOK_SHIPPING_KNOWN_NESTED_FIELDS,
@@ -662,3 +663,85 @@ def test_idempotent_full_replay_of_same_payload_twice_matches_aggregate():
 # of scope for canonical_normalizer's no-DB/no-network unit tests. Not
 # fabricated here; flagged as a gap for whoever wires
 # aggregate_tiktok_finance_skus into incr_worker.py's write loop.
+
+
+# =====================================================================
+# 8. decide_settlement_write — Phase 6C P4-bis TRANSIENT_SETTLEMENT_
+#    REGRESSION guard. Regression coverage tied to the real production
+#    incident: order 586086803325813933, confirmed-good MATCHED/134669
+#    silently overwritten with UNKNOWN/NULL by one glitched API call.
+# =====================================================================
+
+def test_d1_no_existing_row_incoming_unknown_writes_pending_as_before():
+    # existing=NULL, incoming=UNKNOWN -> nothing to protect, write as computed
+    assert decide_settlement_write(None, "UNKNOWN") == "WRITE"
+
+
+def test_d2_existing_matched_incoming_matched_new_valid_writes():
+    existing = {"settlement_type": "MATCHED", "settlement_amount": Decimal("100")}
+    assert decide_settlement_write(existing, "MATCHED") == "WRITE"
+
+
+def _simulate_write_with_retry(existing, incoming_status, retry_status):
+    """Mirrors incr_worker.py's guard usage: decide -> if RETRY, re-fetch
+    once (simulated by retry_status) -> WRITE only if the retry itself
+    resolves to MATCHED, else PRESERVE (skip) + warning."""
+    decision = decide_settlement_write(existing, incoming_status)
+    if decision == "WRITE":
+        return ("WRITE", incoming_status)
+    # decision == "RETRY"
+    if retry_status == "MATCHED":
+        return ("WRITE", retry_status)
+    return ("PRESERVE", existing["settlement_type"])
+
+
+def test_d3_existing_matched_incoming_unknown_retry_matched_uses_retry():
+    existing = {"settlement_type": "MATCHED", "settlement_amount": Decimal("134669")}
+    action, final_status = _simulate_write_with_retry(existing, "UNKNOWN", retry_status="MATCHED")
+    assert action == "WRITE"
+    assert final_status == "MATCHED"
+
+
+def test_d4_existing_matched_incoming_unknown_retry_still_unknown_preserves():
+    existing = {"settlement_type": "MATCHED", "settlement_amount": Decimal("134669")}
+    action, final_status = _simulate_write_with_retry(existing, "UNKNOWN", retry_status="UNKNOWN")
+    assert action == "PRESERVE"
+    assert final_status == "MATCHED"  # existing value never touched
+
+
+def test_d5_existing_explicit_zero_settlement_still_counts_as_confirmed_good():
+    # A real MATCHED order can legitimately settle to exactly 0 (e.g. a
+    # fully-discounted order) -- explicit zero must still be protected,
+    # never treated as "no real value to protect".
+    existing = {"settlement_type": "MATCHED", "settlement_amount": Decimal("0")}
+    assert decide_settlement_write(existing, "UNKNOWN") == "RETRY"
+
+
+def test_d6_null_settlement_amount_is_not_confirmed_good_even_if_matched():
+    # NULL != 0: a row with settlement_type='MATCHED' but a NULL amount
+    # (shouldn't normally happen, but must not be trusted as "confirmed
+    # good" if it does) does not block a fresh write.
+    existing = {"settlement_type": "MATCHED", "settlement_amount": None}
+    assert decide_settlement_write(existing, "UNKNOWN") == "WRITE"
+
+
+def test_d7_replay_same_valid_payload_idempotent():
+    existing = {"settlement_type": "MATCHED", "settlement_amount": Decimal("134669")}
+    action, final_status = _simulate_write_with_retry(existing, "MATCHED", retry_status="MATCHED")
+    assert action == "WRITE"
+    assert final_status == "MATCHED"
+    # calling again with the same inputs must yield the identical decision
+    action2, final_status2 = _simulate_write_with_retry(existing, "MATCHED", retry_status="MATCHED")
+    assert (action2, final_status2) == (action, final_status)
+
+
+def test_d8_guard_does_not_affect_sku_transaction_or_aggregate_writer():
+    # decide_settlement_write is a standalone function with no shared
+    # state or side effects on the sku-level lossless/aggregate layer --
+    # calling it (in any decision) must not change what
+    # aggregate_tiktok_finance_skus computes for the same tx data.
+    tx = _tt_tx(revenue_overrides={"subtotal_before_discount_amount": "1000"})
+    before = aggregate_tiktok_finance_skus([tx])
+    decide_settlement_write({"settlement_type": "MATCHED", "settlement_amount": Decimal("100")}, "UNKNOWN")
+    after = aggregate_tiktok_finance_skus([tx])
+    assert before["computed_revenue"] == after["computed_revenue"] == Decimal("1000")
