@@ -490,26 +490,29 @@ def run_affiliate_ams(cur, etl_run_id, shop_id, window_start, window_end, log, t
     import hashlib
     import hmac
 
-    import keyring
     import requests
 
     ams_auth_dir = SHOPEE_DIR / "auth"
     if str(ams_auth_dir) not in sys.path:
         sys.path.insert(0, str(ams_auth_dir))
     from config import API_HOST as AMS_API_HOST  # noqa: E402
-    from config import KEYCHAIN_SERVICE as AMS_KEYCHAIN_SERVICE  # noqa: E402
     from token_exchange_ams import (  # noqa: E402
         ACCOUNT_AMS_ACCESS_TOKEN,
         ACCOUNT_AMS_ACCESS_TOKEN_EXPIRE_AT,
         ACCOUNT_AMS_LIVE_PARTNER_KEY,
         ACCOUNT_AMS_SHOP_ID,
         AMS_PARTNER_ID,
+        get_secret,
     )
 
     # P8.4 Section H — same pre-flight refresh gap as the main Shopee app
     # token, fixed the same way: check expiry before any call, not after
     # a failure. Separate AMS_* credentials, never the production app's.
-    expire_at = keyring.get_password(AMS_KEYCHAIN_SERVICE, ACCOUNT_AMS_ACCESS_TOKEN_EXPIRE_AT)
+    # P11-BIS — routed through get_secret() (bundle -> legacy env ->
+    # Keychain) instead of a raw keyring.get_password() call, so this
+    # works on a GitHub Actions runner (no OS keychain) the same way the
+    # main Shopee app's credentials already do.
+    expire_at = get_secret(ACCOUNT_AMS_ACCESS_TOKEN_EXPIRE_AT)
     needs_refresh = True
     if expire_at:
         try:
@@ -525,9 +528,9 @@ def run_affiliate_ams(cur, etl_run_id, shop_id, window_start, window_end, log, t
         return None if x in (None, "") else x
 
     def ams_get(path: str, extra: dict) -> dict:
-        partner_key = keyring.get_password(AMS_KEYCHAIN_SERVICE, ACCOUNT_AMS_LIVE_PARTNER_KEY)
-        access_token = keyring.get_password(AMS_KEYCHAIN_SERVICE, ACCOUNT_AMS_ACCESS_TOKEN)
-        ams_shop_id = int(keyring.get_password(AMS_KEYCHAIN_SERVICE, ACCOUNT_AMS_SHOP_ID))
+        partner_key = get_secret(ACCOUNT_AMS_LIVE_PARTNER_KEY)
+        access_token = get_secret(ACCOUNT_AMS_ACCESS_TOKEN)
+        ams_shop_id = int(get_secret(ACCOUNT_AMS_SHOP_ID))
         ts = int(time.time())
         base = f"{AMS_PARTNER_ID}{path}{ts}{access_token}{ams_shop_id}"
         s = hmac.new(partner_key.encode("utf-8"), base.encode("utf-8"), hashlib.sha256).hexdigest()

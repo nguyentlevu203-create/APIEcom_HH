@@ -29,6 +29,8 @@ from __future__ import annotations
 import argparse
 import hashlib
 import hmac
+import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -38,6 +40,7 @@ import requests
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from config import API_HOST, KEYCHAIN_SERVICE, TOKEN_GET_PATH  # noqa: E402
+from keychain import CredentialPersistenceCriticalFailure  # noqa: E402
 
 AMS_PARTNER_ID = 2044772  # "Affiliate for order" app, Live Partner_id (open.shopee.com/console/app/241801)
 
@@ -60,7 +63,52 @@ REAUTH_ERROR_MARKERS = (
 )
 
 
+# The two fields that rotate together every AMS token refresh (distinct
+# from AMS_LIVE_PARTNER_KEY/AMS_SHOP_ID/AMS_PARTNER_ID_STORED, which are
+# static). Their JSON key names inside the bundled
+# SHOPEE_AMS_TOKEN_STATE_JSON secret — a SEPARATE bundle from the main
+# app's SHOPEE_TOKEN_STATE_JSON, since these are different Shopee apps
+# (AMS_PARTNER_ID 2044772 vs the main LIVE_PARTNER_ID 2044177).
+_ROTATING_JSON_KEYS_AMS = {
+    ACCOUNT_AMS_ACCESS_TOKEN: "access_token",
+    ACCOUNT_AMS_REFRESH_TOKEN: "refresh_token",
+    ACCOUNT_AMS_ACCESS_TOKEN_EXPIRE_AT: "access_token_expire_at",
+    ACCOUNT_AMS_REFRESH_TOKEN_EXPIRE_AT: "refresh_token_expire_at",
+}
+
+
+def _bundled_ams_rotating_state():
+    raw = os.environ.get("SHOPEE_AMS_TOKEN_STATE_JSON")
+    if not raw:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except (ValueError, TypeError):
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _running_in_github_actions() -> bool:
+    return os.environ.get("GITHUB_ACTIONS") == "true"
+
+
 def get_secret(account: str):
+    # Same precedence as the main app's keychain.get_secret(): (1) bundled
+    # SHOPEE_AMS_TOKEN_STATE_JSON for the two rotating fields, (2) legacy
+    # SHOPEE_AMS_<account> env var, (3) local Keychain. A present-but-
+    # empty/null bundled field falls through rather than standing in for
+    # a different credential.
+    json_key = _ROTATING_JSON_KEYS_AMS.get(account)
+    if json_key is not None:
+        bundled = _bundled_ams_rotating_state()
+        if bundled is not None:
+            value = bundled.get(json_key)
+            if value:
+                return str(value)
+
+    env_value = os.environ.get(f"SHOPEE_{account}")
+    if env_value:
+        return env_value
     return keyring.get_password(KEYCHAIN_SERVICE, account)
 
 
@@ -70,6 +118,51 @@ def set_secret(account: str, value: str) -> None:
 
 def has_secret(account: str) -> bool:
     return bool(get_secret(account))
+
+
+def persist_ams_rotating_state(
+    access_token: str,
+    refresh_token: str,
+    access_token_expire_at: str,
+    refresh_token_expire_at: str,
+) -> None:
+    """Durably persist a freshly-rotated AMS token state. Mirrors
+    keychain.persist_rotating_state() exactly, but for the separate AMS
+    app and its own SHOPEE_AMS_TOKEN_STATE_JSON bundle — never touches
+    SHOPEE_TOKEN_STATE_JSON (main app)."""
+    if not _running_in_github_actions():
+        set_secret(ACCOUNT_AMS_ACCESS_TOKEN, access_token)
+        set_secret(ACCOUNT_AMS_REFRESH_TOKEN, refresh_token)
+        set_secret(ACCOUNT_AMS_ACCESS_TOKEN_EXPIRE_AT, access_token_expire_at)
+        set_secret(ACCOUNT_AMS_REFRESH_TOKEN_EXPIRE_AT, refresh_token_expire_at)
+        return
+
+    from github_secrets_writer import put_secret_with_retry
+
+    repo = os.environ.get("GITHUB_REPOSITORY")
+    writer_token = os.environ.get("GH_SECRETS_WRITER_TOKEN")
+    if not repo or not writer_token:
+        raise CredentialPersistenceCriticalFailure(
+            "GITHUB_REPOSITORY or GH_SECRETS_WRITER_TOKEN missing from the "
+            "GitHub Actions environment — cannot durably persist rotated AMS state"
+        )
+
+    state_json = json.dumps(
+        {
+            "access_token": access_token,
+            "refresh_token": refresh_token,
+            "access_token_expire_at": access_token_expire_at,
+            "refresh_token_expire_at": refresh_token_expire_at,
+        }
+    )
+    os.environ["SHOPEE_AMS_TOKEN_STATE_JSON"] = state_json
+    ok = put_secret_with_retry("SHOPEE_AMS_TOKEN_STATE_JSON", state_json, repo, writer_token)
+    del state_json
+    if not ok:
+        raise CredentialPersistenceCriticalFailure(
+            "durable persistence of rotated Shopee AMS token state to "
+            "GitHub Secrets failed after retries"
+        )
 
 
 def sign(partner_id: int, path: str, timestamp: int, partner_key: str) -> str:
