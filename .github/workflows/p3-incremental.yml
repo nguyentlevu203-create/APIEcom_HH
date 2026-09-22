@@ -85,7 +85,15 @@ jobs:
     # a catch-up while still bounding a genuinely hung job. Not removed
     # entirely, not parallelized — revisit downward once steady-state
     # (small incremental window) run durations are observed.
-    timeout-minutes: 60
+    #
+    # P11-TER (2026-09-22): scripts/run_production_cycle.py now bounds
+    # each stage explicitly (ingestion 3600s + reconciliation 1800s +
+    # healthcheck 120s = up to ~92 min worst case) instead of one hidden
+    # 1800s covering the whole cycle — 60 min could no longer fit a real
+    # catch-up ingestion window on its own. Raised to 90 for this
+    # checkpoint's controlled run; still bounded, still revisit downward
+    # once steady-state durations are observed.
+    timeout-minutes: 90
     env:
       TZ: UTC
     steps:

@@ -45,7 +45,24 @@ LOG_DIR = ARTIFACTS_V0 / "cycle_logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 LOCK_PATH = LOG_DIR / "production_cycle.lock"
 
+sys.path.insert(0, str(ROOT / "pipelines"))
+import incr_common as ic  # noqa: E402
+
 PY = sys.executable
+
+# P11-TER.3 — explicit, per-stage timeouts. Previously every subprocess
+# in this file (ingestion, each Gold script, reconciliation) shared one
+# hidden 1800s default in run_subprocess(), even though a single Gold-
+# chain-adjacent domain (Shopee/TikTok finance) is separately allowed up
+# to FINANCE_TIMEOUT_SECONDS=3600s by pipelines/incremental.py itself —
+# proven live: the 1800s cap killed the whole ingestion subprocess mid
+# TikTok-finance-fetch, well before that domain's own, larger timeout
+# ever had a chance to fire. Each stage now gets its own bound sized to
+# what that stage actually does; none of them is "no timeout".
+INGESTION_TIMEOUT_SECONDS = 3600  # covers realistic multi-day catch-up across all domains
+GOLD_SCRIPT_TIMEOUT_SECONDS = 600  # one Gold/PNL script, DB-only, no external API calls
+RECONCILIATION_TIMEOUT_SECONDS = 1800  # D-1/D-3/D-7 re-check across all domains
+HEALTHCHECK_TIMEOUT_SECONDS = 120  # unchanged — already its own explicit bound
 
 
 class AlreadyRunningError(Exception):
@@ -107,34 +124,69 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def run_subprocess(label: str, args: list[str], cwd: Path) -> dict:
+def run_subprocess(label: str, args: list[str], cwd: Path, timeout: float) -> dict:
+    """P11-TER.3/4 — timeout is always explicit per call site (no shared
+    default) and containment is delegated to
+    incr_common.run_contained_subprocess(), which runs the child in its
+    own process group and terminates that whole group on timeout instead
+    of leaking a grandchild worker process (see that function's
+    docstring for the proven-live failure mode this replaces)."""
     started_at = now_iso()
     try:
-        r = subprocess.run(args, capture_output=True, text=True, cwd=cwd, timeout=1800)
-        finished_at = now_iso()
-        status = "SUCCESS" if r.returncode == 0 else "FAILED"
-        return {
-            "label": label, "started_at": started_at, "finished_at": finished_at,
-            "status": status, "returncode": r.returncode,
-            "stdout_tail": r.stdout[-4000:], "stderr_tail": r.stderr[-2000:] if r.returncode != 0 else None,
-        }
-    except subprocess.TimeoutExpired as e:
-        return {
-            "label": label, "started_at": started_at, "finished_at": now_iso(),
-            "status": "TIMEOUT", "returncode": None,
-            "stdout_tail": (e.stdout or b"").decode(errors="replace")[-2000:] if isinstance(e.stdout, bytes) else str(e.stdout)[-2000:],
-            "stderr_tail": "subprocess exceeded 1800s timeout",
-        }
+        r, timed_out = ic.run_contained_subprocess(args, cwd, timeout)
     except Exception as e:  # noqa: BLE001
         return {
             "label": label, "started_at": started_at, "finished_at": now_iso(),
             "status": "EXCEPTION", "returncode": None, "stdout_tail": None, "stderr_tail": str(e),
         }
+    finished_at = now_iso()
+    if timed_out:
+        return {
+            "label": label, "started_at": started_at, "finished_at": finished_at,
+            "status": "TIMEOUT", "returncode": r.returncode,
+            "stdout_tail": (r.stdout or "")[-2000:],
+            "stderr_tail": f"subprocess exceeded {timeout}s timeout, process group terminated",
+        }
+    status = "SUCCESS" if r.returncode == 0 else "FAILED"
+    return {
+        "label": label, "started_at": started_at, "finished_at": finished_at,
+        "status": status, "returncode": r.returncode,
+        "stdout_tail": r.stdout[-4000:], "stderr_tail": r.stderr[-2000:] if r.returncode != 0 else None,
+    }
+
+
+def finalize_orphaned_running_rows(cycle_started_at: str, reason: str) -> int:
+    """P11-TER.5 — after this cycle's own ingestion/reconciliation
+    subprocess is timeout-killed, any control.etl_run_log row still
+    'running' that THIS cycle started (started_at >= cycle_started_at)
+    can never be finalized by its own dead worker process anymore — we
+    just proved that process tree is gone. Finalize using the
+    established 'fail' status (never invents new vocabulary). Scoped
+    strictly to started_at >= cycle_started_at so it can never touch the
+    5 pre-existing historical orphan rows (stale since 2026-09-14,
+    explicitly out of scope for this checkpoint) or any row belonging to
+    a different, still-legitimately-running cycle."""
+    conn = ic.get_db_conn()
+    conn.autocommit = True
+    cur = conn.cursor()
+    cur.execute(
+        """UPDATE control.etl_run_log
+           SET status='fail', finished_at=now(), rows_processed=0,
+               error_message=%s
+           WHERE status='running' AND started_at >= %s
+           RETURNING etl_run_id;""",
+        (reason, cycle_started_at),
+    )
+    finalized = cur.fetchall()
+    conn.close()
+    return len(finalized)
 
 
 def run_ingestion() -> dict:
     """API -> CORE. Per-domain isolated inside incremental.py itself."""
-    result = run_subprocess("incremental_ingestion", [PY, "pipelines/incremental.py"], ROOT)
+    result = run_subprocess(
+        "incremental_ingestion", [PY, "pipelines/incremental.py"], ROOT, INGESTION_TIMEOUT_SECONDS,
+    )
     per_domain = {}
     if result["stdout_tail"]:
         try:
@@ -151,12 +203,15 @@ def run_ingestion() -> dict:
 def run_gold_chain() -> list[dict]:
     steps = []
     for label, script in GOLD_CHAIN:
-        steps.append(run_subprocess(label, [PY, script], ARTIFACTS_V0))
+        steps.append(run_subprocess(label, [PY, script], ARTIFACTS_V0, GOLD_SCRIPT_TIMEOUT_SECONDS))
     return steps
 
 
 def run_reconciliation() -> dict:
-    return run_subprocess("reconciliation (D-1/D-3/D-7 re-check)", [PY, "pipelines/reconcile.py"], ROOT)
+    return run_subprocess(
+        "reconciliation (D-1/D-3/D-7 re-check)", [PY, "pipelines/reconcile.py"], ROOT,
+        RECONCILIATION_TIMEOUT_SECONDS,
+    )
 
 
 def run_source_coverage_snapshot() -> dict:
@@ -205,6 +260,12 @@ def main():
     ingestion = run_ingestion()
     log["ingestion"] = ingestion
     print(f"ingestion status: {ingestion['status']}")
+    if ingestion["status"] == "TIMEOUT":
+        # P11-TER.5 — we just terminated incremental.py's whole process
+        # group (see run_contained_subprocess), so any row it started
+        # this cycle that's still 'running' is now provably orphaned.
+        n = finalize_orphaned_running_rows(cycle_started_at, "ORCHESTRATOR_TIMEOUT")
+        print(f"finalized {n} orphaned etl_run_log row(s) from this cycle's ingestion timeout")
 
     print("--- STEP 2: CORE -> GOLD (chain, dependency order) ---")
     gold_steps = run_gold_chain()
@@ -216,6 +277,9 @@ def main():
     recon = run_reconciliation()
     log["reconciliation"] = recon
     print(f"reconciliation status: {recon['status']}")
+    if recon["status"] == "TIMEOUT":
+        n = finalize_orphaned_running_rows(cycle_started_at, "ORCHESTRATOR_TIMEOUT")
+        print(f"finalized {n} orphaned etl_run_log row(s) from this cycle's reconciliation timeout")
 
     print("--- STEP 4: source coverage snapshot ---")
     try:

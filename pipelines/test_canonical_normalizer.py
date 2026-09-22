@@ -44,6 +44,17 @@ EVIDENCE_DIR = Path(__file__).parent.parent / "artifacts" / "v0" / "API_CONTRACT
     (-185000, Decimal("-185000")),   # negative (refund)
     ("-185000", Decimal("-185000")),
     (12.5, Decimal("12.5")),
+    # P11-TER.1 — Shopee AMS get_product_performance returns the literal
+    # sentinel "--" for a metric that's mathematically undefined (e.g.
+    # roi with zero spend), not zero. Production-proven: this exact
+    # value crashed the fact_shopee_affiliate_performance_daily INSERT
+    # with "invalid input syntax for type numeric" on 2026-09-17 and
+    # 2026-09-21 (same product both times) before incr_worker.py's local
+    # D() helper was fixed to route through parse_numeric() instead of
+    # passing non-empty strings through unchanged.
+    ("--", None),
+    ("-", None),        # same class of dash-only placeholder, not a real value
+    ("N/A", None),       # any other unparseable sentinel -> NULL, never 0
 ])
 def test_parse_numeric_explicit_contract(raw_value, expected):
     assert parse_numeric(raw_value) == expected

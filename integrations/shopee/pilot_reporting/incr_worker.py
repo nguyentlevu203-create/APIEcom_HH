@@ -34,6 +34,19 @@ import incr_common as ic  # noqa: E402
 from canonical_normalizer import normalize_shopee_escrow, parse_numeric  # noqa: E402
 
 
+def _parse_retry_after(raw) -> float | None:
+    """RFC 7231 Retry-After: either an integer seconds count or an
+    HTTP-date. Returns None (falls back to the default backoff table) for
+    a missing header, an HTTP-date (rare for this API, not worth the
+    parsing surface), or anything unparseable."""
+    if not raw:
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None
+
+
 def shopee_check(resp: dict) -> dict:
     if resp.get("_http_status") in ic.TRANSIENT_HTTP:
         raise ic.TransientHTTPError(str(resp.get("_http_status")))
@@ -525,7 +538,14 @@ def run_affiliate_ams(cur, etl_run_id, shop_id, window_start, window_end, log, t
             raise RuntimeError("Shopee AMS access_token pre-flight refresh failed.")
 
     def D(x):
-        return None if x in (None, "") else x
+        # AMS performance metrics (roi in particular) return the literal
+        # sentinel "--" when the metric is mathematically undefined (e.g.
+        # ROI with zero spend), not zero — parse_numeric already treats
+        # any non-numeric string as NULL, which is the correct semantic
+        # here (production proof: control.etl_run_log shows this exact
+        # field crashing the INSERT with "invalid input syntax for type
+        # numeric" on 2026-09-17 and 2026-09-21, same product both times).
+        return parse_numeric(x)
 
     def ams_get(path: str, extra: dict) -> dict:
         partner_key = get_secret(ACCOUNT_AMS_LIVE_PARTNER_KEY)
@@ -542,6 +562,7 @@ def run_affiliate_ams(cur, etl_run_id, shop_id, window_start, window_end, log, t
         r = requests.get(f"{AMS_API_HOST}{path}", params=params, timeout=20)
         data = r.json()
         data["_http_status"] = r.status_code
+        data["_retry_after"] = _parse_retry_after(r.headers.get("Retry-After"))
         return data
 
     def paginate(path: str, base_params: dict):
@@ -549,7 +570,7 @@ def run_affiliate_ams(cur, etl_run_id, shop_id, window_start, window_end, log, t
         while True:
             data = ams_get(path, dict(base_params, page_no=page_no, page_size=20))
             if data.get("_http_status") in ic.TRANSIENT_HTTP:
-                raise ic.TransientHTTPError(str(data.get("_http_status")))
+                raise ic.TransientHTTPError(str(data.get("_http_status")), retry_after=data.get("_retry_after"))
             if data.get("error"):
                 raise RuntimeError(f"AMS API error: {data.get('error')} - {data.get('message')}")
             resp = data.get("response") or {}

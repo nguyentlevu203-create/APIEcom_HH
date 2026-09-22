@@ -98,14 +98,33 @@ def run_reconcile_domain(source_system: str, domain: str, shop_id: str, business
     conn.close()
 
     worker = WORKER_BY_SYSTEM[source_system]
-    proc = subprocess.run(
+    recon_timeout = 900
+    proc, timed_out = ic.run_contained_subprocess(
         [sys.executable, str(worker), domain, window_start.isoformat(), window_end.isoformat(),
          etl_run_id, "reconcile", business_date.isoformat()],
-        cwd=str(worker.parent), capture_output=True, text=True, timeout=900,
+        worker.parent, recon_timeout,
     )
     print(proc.stdout, end="")
     if proc.stderr:
         print(proc.stderr, file=sys.stderr, end="")
+
+    if timed_out:
+        # P11-TER.5 — proven live: this exact gap left a TIKTOK/finance
+        # reconciliation row 'running' forever. A bare subprocess.run(
+        # timeout=...) raised TimeoutExpired here uncaught, which crashed
+        # this whole process mid-loop (exit code 1, no traceback captured
+        # by the orchestrator) — every domain still queued after the one
+        # that hit this timeout silently never ran, with no record of
+        # why. run_contained_subprocess() already terminated the
+        # worker's full process group, so this domain is now a normal,
+        # isolated FAIL and the loop continues to the next domain.
+        error = f"DOMAIN_WORKER_TIMEOUT: worker exceeded {recon_timeout}s, process group terminated"
+        ic.finish_run_log(source_system, domain, etl_run_id, "fail", 0, error)
+        return {
+            "status": "FAIL", "business_date": business_date.isoformat(),
+            "window_start": window_start.isoformat(), "window_end": window_end.isoformat(),
+            "etl_run_id": etl_run_id, "error": error,
+        }
 
     worker_result = None
     for line in reversed(proc.stdout.strip().splitlines()):

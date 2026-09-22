@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import json
 import os
+import signal
+import subprocess
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -139,19 +141,39 @@ class Counters:
         }
 
 
+MAX_RETRY_AFTER_SECONDS = 120  # cap a server-supplied Retry-After so one bad header can't stall a run
+
+
 class TransientHTTPError(RuntimeError):
-    pass
+    """retry_after: seconds from the server's Retry-After header (429/503),
+    when the caller was able to read it. None means 'no header, use the
+    default backoff table' — every existing raise site keeps working
+    unchanged."""
+
+    def __init__(self, message: str, retry_after: Optional[float] = None):
+        super().__init__(message)
+        self.retry_after = retry_after
 
 
 def with_backoff(fn, label: str, log):
-    """Bounded exponential backoff (5s/15s/45s) for transient failures
-    only (Section 9) — a real error is raised immediately, never retried
-    forever."""
+    """Bounded backoff for transient failures only (Section 9) — a real
+    error is raised immediately, never retried forever. Default delays
+    are 5s/15s/45s; a 429/503 that carries a Retry-After header overrides
+    the next delay with that value (capped at MAX_RETRY_AFTER_SECONDS,
+    still bounded to len(BACKOFF_DELAYS) total retries — no infinite
+    loop)."""
     import requests
     last_exc = None
-    for attempt, delay in enumerate((0,) + BACKOFF_DELAYS, start=1):
-        if delay:
-            log(f"{label}: transient failure, retry {attempt-1}/{len(BACKOFF_DELAYS)} after {delay}s")
+    for attempt, default_delay in enumerate((0,) + BACKOFF_DELAYS, start=1):
+        if default_delay:
+            retry_after = getattr(last_exc, "retry_after", None)
+            if retry_after is not None:
+                delay = min(max(retry_after, 0), MAX_RETRY_AFTER_SECONDS)
+                log(f"{label}: transient failure, retry {attempt-1}/{len(BACKOFF_DELAYS)} "
+                    f"after {delay}s (server Retry-After)")
+            else:
+                delay = default_delay
+                log(f"{label}: transient failure, retry {attempt-1}/{len(BACKOFF_DELAYS)} after {delay}s")
             time.sleep(delay)
         try:
             return fn()
@@ -162,6 +184,58 @@ def with_backoff(fn, label: str, log):
             last_exc = e
             continue
     raise last_exc  # noqa: RSE102
+
+
+PROCESS_GROUP_KILL_GRACE_SECONDS = 10
+
+
+def run_contained_subprocess(args: list[str], cwd, timeout: float):
+    """P11-TER.4 — run a subprocess (and anything it spawns) in its own
+    POSIX process group/session so a timeout can be contained cleanly.
+
+    Plain subprocess.run(timeout=...) only signals the direct child;
+    if that child has itself spawned a worker subprocess (as both
+    pipelines/incremental.py and pipelines/reconcile.py do, one level
+    down, per due domain), the grandchild is orphaned and keeps running
+    unsupervised — proven live: a killed cycle left an in-flight TikTok
+    finance worker running with no caller left to record its outcome.
+
+    On timeout: SIGTERM the whole group, give it
+    PROCESS_GROUP_KILL_GRACE_SECONDS to exit, then SIGKILL if still
+    alive. Never raises subprocess.TimeoutExpired — callers must check
+    the returned `timed_out` flag instead, so a timeout is always an
+    explicit, handled outcome rather than an uncaught exception that
+    would crash the caller and skip every subsequent domain.
+
+    Returns (CompletedProcess-like with .returncode/.stdout/.stderr,
+    timed_out: bool).
+    """
+    proc = subprocess.Popen(
+        args, cwd=str(cwd), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, start_new_session=True,
+    )
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+        return subprocess.CompletedProcess(args, proc.returncode, stdout, stderr), False
+    except subprocess.TimeoutExpired:
+        pass
+
+    def _signal_group(sig):
+        try:
+            os.killpg(os.getpgid(proc.pid), sig)
+        except ProcessLookupError:
+            pass  # already exited between the timeout firing and the signal
+
+    _signal_group(signal.SIGTERM)
+    try:
+        stdout, stderr = proc.communicate(timeout=PROCESS_GROUP_KILL_GRACE_SECONDS)
+    except subprocess.TimeoutExpired:
+        _signal_group(signal.SIGKILL)
+        try:
+            stdout, stderr = proc.communicate(timeout=PROCESS_GROUP_KILL_GRACE_SECONDS)
+        except subprocess.TimeoutExpired:
+            stdout, stderr = "", ""
+    return subprocess.CompletedProcess(args, proc.returncode, stdout, stderr), True
 
 
 def simple_log(prefix: str):

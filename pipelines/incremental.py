@@ -125,13 +125,27 @@ def run_domain(source_system: str, domain: str, shop_id: str, force: bool) -> di
 
     worker = WORKER_BY_SYSTEM[source_system]
     worker_timeout = DOMAIN_TIMEOUT_SECONDS.get(domain, DEFAULT_WORKER_TIMEOUT_SECONDS)
-    proc = subprocess.run(
+    proc, timed_out = ic.run_contained_subprocess(
         [sys.executable, str(worker), domain, window_start.isoformat(), now.isoformat(), etl_run_id],
-        cwd=str(worker.parent), capture_output=True, text=True, timeout=worker_timeout,
+        worker.parent, worker_timeout,
     )
     print(proc.stdout, end="")
     if proc.stderr:
         print(proc.stderr, file=sys.stderr, end="")
+
+    if timed_out:
+        # P11-TER.4/5 — a plain subprocess.run(timeout=...) here would
+        # raise TimeoutExpired uncaught, crashing this whole process mid
+        # loop: the in-flight domain's run-log row would stay 'running'
+        # forever AND every domain still queued after it would silently
+        # never run. run_contained_subprocess() already terminated the
+        # worker's full process group, so the domain is a normal FAIL.
+        error = f"DOMAIN_WORKER_TIMEOUT: worker exceeded {worker_timeout}s, process group terminated"
+        ic.finish_run_log(source_system, domain, etl_run_id, "fail", 0, error)
+        return {
+            "status": "FAIL", "window_start": window_start.isoformat(), "window_note": window_note,
+            "cadence_minutes": cadence, "etl_run_id": etl_run_id, "error": error,
+        }
 
     worker_result = None
     for line in reversed(proc.stdout.strip().splitlines()):
