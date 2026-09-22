@@ -180,6 +180,47 @@ def build_approved_master():
 
 
 # =====================================================================
+# P11-QUATER-BIS — role_map sourced from Neon, not the local keymap file
+# =====================================================================
+
+def build_role_map_from_db(cur) -> dict:
+    """Replaces build_approved_master() for every GOLD_CHAIN caller that
+    only ever wanted role_map (default_role, channel_role_override) —
+    every one of them, confirmed by reading each call site (see the
+    P11-QUATER report). core.dim_product.default_transaction_role
+    already carries this exact classification: parity-tested 97/97
+    exact match against every hh_sku _p5a_keymap.json covers before this
+    replaced it (see the P11-QUATER-BIS report) — 100% row coverage,
+    100% field parity, zero conflicts, zero gaps. No local file, no
+    business/product-catalog data leaves Neon.
+
+    The 2 HH-approved exceptions build_approved_master() also hardcoded
+    (never sourced from any file — pure code, already safe to commit)
+    carry over unchanged:
+      - "1 BÁNH-XP": channel-dependent role override (approved).
+      - "Quà Tặng Túi": brand-new approved item, no EAN — its role
+        (PACKAGING) is data; its real HH-approved unit_cost_vnd is
+        deliberately NOT reproduced here (redacted in
+        build_approved_master() too — see MISSING_COST_001 above) since
+        no caller of this function ever needs unit_cost_vnd from here;
+        it comes from core.dim_cogs in fetch_snapshot() instead.
+    """
+    cur.execute(
+        "SELECT sku, default_transaction_role FROM core.dim_product "
+        "WHERE default_transaction_role IS NOT NULL;"
+    )
+    role_map = {sku: (role, None) for sku, role in cur.fetchall()}
+
+    if "1 BÁNH-XP" in role_map:
+        default_role, _ = role_map["1 BÁNH-XP"]
+        role_map["1 BÁNH-XP"] = (default_role, {"SHOPEE": "PROMO_GIFT", "TIKTOK": "SALE"})
+    if "Quà Tặng Túi" not in role_map:
+        role_map["Quà Tặng Túi"] = ("PACKAGING", None)
+
+    return role_map
+
+
+# =====================================================================
 # Load dim_product / dim_cogs
 # =====================================================================
 

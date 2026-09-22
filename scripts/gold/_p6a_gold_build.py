@@ -25,7 +25,7 @@ import psycopg2
 
 sys.path.insert(0, str(Path(__file__).parent))
 from _gold_ownership import guarded_upsert  # noqa: E402
-from _p5b_load import build_approved_master  # noqa: E402
+from _p5b_load import build_role_map_from_db  # noqa: E402
 from _p5b_recompute import fetch_snapshot, get_conn, run_pass  # noqa: E402
 
 CHANNELS = ["SHOPEE", "TIKTOK"]
@@ -148,11 +148,11 @@ def main():
         settlement_agg[(c, d)][stype] = {"settlement_amount": samt, "revenue": rev, "fee_and_tax": fee, "shipping": ship, "count": cnt}
 
     # ---------------- COGS per day, via the P5 production engine ----------------
-    approved = build_approved_master()
-    role_map = {sku: (item["default_role"], item["channel_role_override"]) for sku, item in approved.items()}
-
+    # P11-QUATER-BIS: role_map now sourced from core.dim_product (Neon),
+    # not the local _p5a_keymap.json — see build_role_map_from_db().
     conn = get_conn()
     cur = conn.cursor()
+    role_map = build_role_map_from_db(cur)
     snap = fetch_snapshot(cur)
     cur.execute("SELECT order_item_key, business_date FROM core.fact_order_item;")
     bd_by_key = dict(cur.fetchall())
