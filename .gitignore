@@ -43,3 +43,12 @@ artifacts/
 exports/
 *.xlsx
 *.xls
+
+# P11-QUATER — scripts/gold/ is otherwise fully version-controlled (it's
+# production code, not generated output), but this one file is real
+# product-catalog business data (SKU/EAN/product names) with no Neon
+# database authority. It's a local copy needed for scripts/gold/ to run
+# on this machine; committing it is a decision for a human, not this
+# ignore rule to preempt by omission. See scripts/test_gold_chain_portability.py
+# and the P11-QUATER report for the full classification.
+scripts/gold/_p5a_keymap.json

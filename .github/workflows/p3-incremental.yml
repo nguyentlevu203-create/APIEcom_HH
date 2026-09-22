@@ -91,9 +91,24 @@ jobs:
     # healthcheck 120s = up to ~92 min worst case) instead of one hidden
     # 1800s covering the whole cycle — 60 min could no longer fit a real
     # catch-up ingestion window on its own. Raised to 90 for this
-    # checkpoint's controlled run; still bounded, still revisit downward
-    # once steady-state durations are observed.
-    timeout-minutes: 90
+    # checkpoint's controlled run.
+    #
+    # P11-QUATER (2026-09-22): 90 min was proven too tight live — the
+    # controlled run's ingestion (3600s) and reconciliation (1800s)
+    # stages alone summed to exactly 90 min, leaving zero margin for
+    # GOLD/setup/coverage/healthcheck/log-upload; GitHub cancelled the
+    # job externally a few seconds before it would have finished
+    # cleanly. scripts/test_run_production_cycle_timeouts.py (Q6) checks
+    # this relationship against the true mathematical worst case — every
+    # stage independently using its full budget, including all 7 Gold
+    # scripts each hitting their own 600s cap — which sums to 9720s
+    # (162 min), not just ingestion+reconciliation's ~92 min. 120 did not
+    # clear that bar. Raised to 170 (9720s + 300s minimum margin the test
+    # requires, rounded up) — still bounded, still not unlimited; in
+    # practice Gold scripts currently fail in under a second (see the
+    # P11-QUATER report), so this ceiling is not expected to be reached,
+    # it exists to catch a genuinely hung job.
+    timeout-minutes: 170
     env:
       TZ: UTC
     steps:

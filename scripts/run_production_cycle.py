@@ -106,6 +106,29 @@ def acquire_single_instance_lock():
     os.write(fd, f"pid={os.getpid()} started_at={datetime.now(timezone.utc).isoformat()}\n".encode())
     return fd  # keep open for the life of the process; GC/exit releases it
 
+# P11-QUATER — Gold-chain scripts used to live only under artifacts/v0/,
+# which .gitignore excludes wholesale as generated/proprietary output. A
+# clean GitHub Actions checkout never had them, so every Gold script
+# failed instantly with "No such file or directory" regardless of the
+# ingestion-timeout fix — an independent defect from P11-TER's
+# containment/timeout work. The 13 files these 7 entrypoints need
+# (transitively) are pure code with no embedded secrets or business
+# data (verified file by file) and now live in version control under
+# scripts/gold/, referenced here by an explicit ROOT-derived path — not
+# an implicit cwd=artifacts/v0 — per scripts/test_gold_chain_portability.py.
+#
+# One real gap remains, deliberately NOT resolved by this move:
+# scripts/gold/_p5a_keymap.json (SKU/EAN/product-name/role mapping) is
+# still required at runtime and still NOT committed — it's genuine
+# product-catalog business data with no Neon database equivalent
+# (unlike COGS $ values, which already live in core.dim_cogs and were
+# confirmed dead weight for this call path, not read from any CSV here
+# at all). See the P11-QUATER report for the full dependency
+# classification. Until that's resolved, Gold scripts will fail
+# cleanly on FileNotFoundError for that one file, not silently produce
+# wrong numbers.
+GOLD_DIR = ROOT / "scripts" / "gold"
+
 # Gold-chain scripts, in required dependency order. Each is BASE_GOLD or
 # PNL_ENRICHMENT ownership-guarded already (see _gold_ownership.py) —
 # this list only sequences them, never edits their logic.
@@ -203,7 +226,9 @@ def run_ingestion() -> dict:
 def run_gold_chain() -> list[dict]:
     steps = []
     for label, script in GOLD_CHAIN:
-        steps.append(run_subprocess(label, [PY, script], ARTIFACTS_V0, GOLD_SCRIPT_TIMEOUT_SECONDS))
+        steps.append(run_subprocess(
+            label, [PY, str(GOLD_DIR / script)], GOLD_DIR, GOLD_SCRIPT_TIMEOUT_SECONDS,
+        ))
     return steps
 
 
