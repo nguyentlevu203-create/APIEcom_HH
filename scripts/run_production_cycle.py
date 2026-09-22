@@ -61,7 +61,15 @@ PY = sys.executable
 # what that stage actually does; none of them is "no timeout".
 INGESTION_TIMEOUT_SECONDS = 3600  # covers realistic multi-day catch-up across all domains
 GOLD_SCRIPT_TIMEOUT_SECONDS = 600  # one Gold/PNL script, DB-only, no external API calls
-RECONCILIATION_TIMEOUT_SECONDS = 1800  # D-1/D-3/D-7 re-check across all domains
+# P11-QUINQUE Q6 — proven live (P11-QUATER-LIVE, run 35706413067):
+# reconciliation ran cleanly for the full 1800s and was still mid TikTok/
+# finance D-3 work when the stage timeout cut it off — a cumulative
+# stage-budget shortfall, not a containment failure (the in-flight domain
+# was still cleanly finalized as ORCHESTRATOR_TIMEOUT). Each per-domain
+# reconciliation call stays independently bounded at 900s
+# (pipelines/reconcile.py); this only gives the stage as a whole enough
+# cumulative room to actually finish a D-1/D-3/D-7 pass.
+RECONCILIATION_TIMEOUT_SECONDS = 3600  # D-1/D-3/D-7 re-check across all domains
 HEALTHCHECK_TIMEOUT_SECONDS = 120  # unchanged — already its own explicit bound
 
 

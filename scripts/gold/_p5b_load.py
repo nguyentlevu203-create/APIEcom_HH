@@ -17,8 +17,10 @@ from collections import defaultdict
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
-import keyring
 import psycopg2
+
+sys.path.insert(0, str(Path(__file__).parent))
+from _gold_db import resolve_writer_url  # noqa: E402
 
 OUT_DIR = Path(__file__).resolve().parent.parent.parent / "artifacts" / "v0"
 KEYMAP_DIR = Path(__file__).resolve().parent
@@ -35,9 +37,11 @@ def D(v):
 
 
 def get_db_conn():
-    url = keyring.get_password("HH_ECOM_NEON", "hh_etl_writer_database_url")
-    conn = psycopg2.connect(url)
-    del url
+    # P11-QUINQUE — env-first (GitHub Actions has no OS Keychain), falls
+    # back to Keychain on the local Mac path. See _gold_db.py.
+    conn = psycopg2.connect(
+        resolve_writer_url(), keepalives=1, keepalives_idle=20, keepalives_interval=10, keepalives_count=3,
+    )
     conn.autocommit = False
     return conn
 

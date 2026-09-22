@@ -4,14 +4,22 @@
 core.dim_cogs + core.dim_combo_bom). Read-only: no INSERT/UPDATE/DELETE
 anywhere in this script.
 
-The only non-DB input is build_approved_master() from _p5b_load.py,
-used strictly to recover the transaction-ROLE rules HH approved
-(SALE / PROMO_GIFT / PACKAGING, incl. the 1 BÁNH-XP per-channel
-override) — role is deliberately not stored in dim_product
-(master_product_type collapses SELLABLE_PRODUCT/PROMO_GIFT into one
-PRODUCT value on purpose, see P5B load report). No COGS value, no
-mapping, and no combo BOM data is taken from any CSV in this script —
-those come from the DB tables exclusively.
+fetch_snapshot()/get_conn()/run_pass() — the only 3 things GOLD_CHAIN
+itself imports from this module — are 100% DB-driven: platform SKU ->
+hh_sku via core.map_platform_product, transaction-ROLE (SALE /
+PROMO_GIFT / PACKAGING, incl. the 1 BÁNH-XP per-channel override) via
+core.dim_product.default_transaction_role (see
+_p5b_load.build_role_map_from_db(), parity-proven 97/97 against the
+local keymap file it replaced — P11-QUATER-BIS). No COGS value, no
+mapping, and no combo BOM data is taken from any CSV — those come from
+the DB tables exclusively, always have.
+
+build_approved_master() (imported below) is used ONLY by this file's
+own main(), i.e. only when run directly (`python3 _p5b_recompute.py`)
+as a standalone historical-COGS diagnostic/report — never by
+GOLD_CHAIN, which never calls main(). That's the one remaining local-
+file read left in the production GOLD path's transitive closure, and
+it's confined to this non-production, manually-invoked code path.
 
 Usage: python3 _p5b_recompute.py
 """
@@ -22,20 +30,22 @@ import sys
 from decimal import Decimal
 from pathlib import Path
 
-import keyring
 import psycopg2
 
 sys.path.insert(0, str(Path(__file__).parent))
-from _p5b_load import build_approved_master  # role rules only
+from _gold_db import resolve_writer_url  # noqa: E402
+from _p5b_load import build_approved_master  # main()'s own report only — see module docstring
 
 OUT_DIR = Path(__file__).resolve().parent.parent.parent / "artifacts" / "v0"
 ROLE_TO_TREATMENT = {"SALE": "SELLABLE_COGS", "PROMO_GIFT": "PROMO_GIFT_COST", "PACKAGING": "PACKAGING_COST"}
 
 
 def get_conn():
-    url = keyring.get_password("HH_ECOM_NEON", "hh_etl_writer_database_url")
-    conn = psycopg2.connect(url)
-    del url
+    # P11-QUINQUE — env-first (GitHub Actions has no OS Keychain), falls
+    # back to Keychain on the local Mac path. See _gold_db.py.
+    conn = psycopg2.connect(
+        resolve_writer_url(), keepalives=1, keepalives_idle=20, keepalives_interval=10, keepalives_count=3,
+    )
     conn.autocommit = True  # read-only session, nothing to commit/rollback
     return conn
 

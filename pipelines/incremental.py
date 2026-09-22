@@ -75,7 +75,19 @@ WORKER_BY_SYSTEM = {"SHOPEE": SHOPEE_WORKER, "TIKTOK": TIKTOK_WORKER}
 # default worker timeout; every other domain keeps the original 600s.
 DEFAULT_WORKER_TIMEOUT_SECONDS = 600
 FINANCE_TIMEOUT_SECONDS = int(os.environ.get("FINANCE_TIMEOUT_SECONDS", "3600"))
-DOMAIN_TIMEOUT_SECONDS = {"finance": FINANCE_TIMEOUT_SECONDS}
+
+# P11-QUINQUE Q5 — keyed by (source_system, domain), not domain alone:
+# TIKTOK/orders proven live (P11-QUATER-LIVE, run 35706413067) to need
+# more than the 600s default on a cold/catch-up window — the same
+# underlying worker completed fine inside reconciliation's separate 900s
+# per-domain allowance right after. A targeted override, not a blanket
+# raise: SHOPEE/orders and every other non-finance domain keep 600s.
+TIKTOK_ORDERS_TIMEOUT_SECONDS = 900
+DOMAIN_TIMEOUT_SECONDS = {
+    ("SHOPEE", "finance"): FINANCE_TIMEOUT_SECONDS,
+    ("TIKTOK", "finance"): FINANCE_TIMEOUT_SECONDS,
+    ("TIKTOK", "orders"): TIKTOK_ORDERS_TIMEOUT_SECONDS,
+}
 
 
 def get_shop_ids() -> dict:
@@ -124,7 +136,7 @@ def run_domain(source_system: str, domain: str, shop_id: str, force: bool) -> di
     conn.close()
 
     worker = WORKER_BY_SYSTEM[source_system]
-    worker_timeout = DOMAIN_TIMEOUT_SECONDS.get(domain, DEFAULT_WORKER_TIMEOUT_SECONDS)
+    worker_timeout = DOMAIN_TIMEOUT_SECONDS.get((source_system, domain), DEFAULT_WORKER_TIMEOUT_SECONDS)
     proc, timed_out = ic.run_contained_subprocess(
         [sys.executable, str(worker), domain, window_start.isoformat(), now.isoformat(), etl_run_id],
         worker.parent, worker_timeout,

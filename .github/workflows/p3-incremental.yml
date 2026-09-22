@@ -108,7 +108,15 @@ jobs:
     # practice Gold scripts currently fail in under a second (see the
     # P11-QUATER report), so this ceiling is not expected to be reached,
     # it exists to catch a genuinely hung job.
-    timeout-minutes: 170
+    #
+    # P11-QUINQUE (2026-09-22) Q6/Q7: RECONCILIATION_TIMEOUT_SECONDS
+    # raised 1800 -> 3600 (proven live, P11-QUATER-LIVE: reconciliation
+    # used its full 1800s and was still mid-domain, a cumulative-budget
+    # shortfall, not a containment failure). New worst-case envelope:
+    # ingestion 3600s + 7 Gold scripts x 600s (4200s) + reconciliation
+    # 3600s + healthcheck 120s = 11520s, +300s minimum margin = 11820s.
+    # 200 min = 12000s clears that with room to spare.
+    timeout-minutes: 200
     env:
       TZ: UTC
     steps:

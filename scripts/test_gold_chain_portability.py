@@ -53,6 +53,7 @@ GOLD_CHAIN_ENTRIES = [
 # Transitive local imports (see the P11-QUATER report's dependency graph).
 GOLD_TRANSITIVE_DEPS = [
     "_gold_ownership.py",
+    "_gold_db.py",  # P11-QUINQUE — shared Neon credential resolver
     "_p5b_load.py",
     "_p5b_recompute.py",
     "_p6b1_finalize.py",
@@ -160,3 +161,23 @@ def test_gold_data_authority_confirmed():
     this test and the report."""
     print("GOLD_DATA_AUTHORITY = NEON (core.dim_product.default_transaction_role)")
     print("GOLD_FILE_DEPENDENCY_REMOVED = TRUE")
+
+
+def test_only_gold_db_resolves_keyring_directly():
+    """P11-QUINQUE Q2/Q10 — static cloud-portability scan: no production
+    GOLD script may call keyring.get_password() directly (that's exactly
+    what broke GOLD on the GitHub runner — proven live, P11-QUATER-LIVE:
+    NoKeyringError, no OS Keychain there). The one allowed call lives in
+    _gold_db.py's resolve_writer_url(), strictly as the fallback AFTER
+    the HH_ETL_WRITER_DATABASE_URL/HH_ECOM_DB_URL_OVERRIDE env checks —
+    every other file must go through that shared helper instead."""
+    for filename in ALL_GOLD_FILES:
+        if filename == "_gold_db.py":
+            continue
+        text = (GOLD_DIR / filename).read_text(encoding="utf-8")
+        assert "keyring.get_password" not in text, (
+            f"{filename} calls keyring.get_password() directly — "
+            f"PRODUCTION_BLOCKER on a GitHub runner (no OS Keychain there). "
+            f"Use _gold_db.resolve_writer_url() instead."
+        )
+    print("PRODUCTION_BLOCKER (direct keyring.get_password outside _gold_db.py) = 0")

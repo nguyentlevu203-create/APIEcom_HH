@@ -22,6 +22,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 CYCLE_SRC = (ROOT / "scripts" / "run_production_cycle.py").read_text(encoding="utf-8")
 WORKFLOW_SRC = (ROOT / ".github" / "workflows" / "p3-incremental.yml").read_text(encoding="utf-8")
+INCREMENTAL_SRC = (ROOT / "pipelines" / "incremental.py").read_text(encoding="utf-8")
 
 
 def _int_constant(src: str, name: str) -> int:
@@ -80,3 +81,51 @@ def test_job_timeout_exceeds_summed_stage_budget():
         f"that's too tight a margin for setup/checkout/install/cleanup/log-upload "
         f"overhead; want at least 300s of headroom"
     )
+
+
+def test_p11_quinque_expected_stage_values():
+    """P11-QUINQUE Q8 — pins the exact values this checkpoint set, so a
+    future edit that silently changes one of them (without also updating
+    the reasoning in the workflow comment) fails loudly here first."""
+    assert _int_constant(CYCLE_SRC, "INGESTION_TIMEOUT_SECONDS") == 3600
+    assert _int_constant(CYCLE_SRC, "GOLD_SCRIPT_TIMEOUT_SECONDS") == 600
+    assert _int_constant(CYCLE_SRC, "RECONCILIATION_TIMEOUT_SECONDS") == 3600
+    assert _int_constant(CYCLE_SRC, "HEALTHCHECK_TIMEOUT_SECONDS") == 120
+    assert _gold_chain_length(CYCLE_SRC) == 7
+    assert _job_timeout_minutes(WORKFLOW_SRC) == 200
+
+
+def test_domain_worker_timeout_selection():
+    """P11-QUINQUE Q5 — TIKTOK/orders gets a targeted 900s override
+    (proven live to need more than the 600s default on a cold/catch-up
+    window); every other non-finance domain, on either platform, stays
+    at the 600s default; finance (both platforms) keeps its existing
+    3600s allowance. Reads pipelines/incremental.py's own
+    DEFAULT_WORKER_TIMEOUT_SECONDS/DOMAIN_TIMEOUT_SECONDS directly rather
+    than re-deriving the lookup logic here, so this fails loudly if that
+    dict's keys or the (source_system, domain) lookup shape ever change."""
+    namespace: dict = {"os": __import__("os")}
+    # Isolate exactly the constants block — this module also does
+    # subprocess/DB work at import time we don't want to trigger here.
+    m = re.search(
+        r"DEFAULT_WORKER_TIMEOUT_SECONDS = .*?\nDOMAIN_TIMEOUT_SECONDS = \{.*?\n\}",
+        INCREMENTAL_SRC, re.DOTALL,
+    )
+    assert m, "could not find the timeout constants block in pipelines/incremental.py"
+    exec(m.group(0), namespace)  # noqa: S102 — trusted local source file, test-only
+
+    default = namespace["DEFAULT_WORKER_TIMEOUT_SECONDS"]
+    domain_timeouts = namespace["DOMAIN_TIMEOUT_SECONDS"]
+
+    assert default == 600
+
+    def resolve(source_system, domain):
+        return domain_timeouts.get((source_system, domain), default)
+
+    assert resolve("TIKTOK", "orders") == 900
+    assert resolve("SHOPEE", "finance") == 3600
+    assert resolve("TIKTOK", "finance") == 3600
+    # unchanged / untouched, per Q5 — "Shopee orders and unrelated domains remain unchanged"
+    assert resolve("SHOPEE", "orders") == 600
+    assert resolve("SHOPEE", "returns") == 600
+    assert resolve("TIKTOK", "product_analytics") == 600
