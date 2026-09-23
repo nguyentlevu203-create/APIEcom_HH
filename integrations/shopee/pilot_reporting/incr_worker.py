@@ -470,6 +470,100 @@ def run_product_inventory(cur, etl_run_id, shop_id, window_start, window_end, lo
     return {"dim_product": product_ctr.as_dict(), "fact_inventory_snapshot": inv_ctr.as_dict()}
 
 
+## P11-HEAL — AMS backlog/catch-up handling.
+#
+# Proven live 2026-09-23 (SHOPEE/affiliate_ams stuck since 2026-09-15):
+# run_affiliate_ams() used to be a single all-or-nothing pass over every
+# day in the backlog — one RuntimeError anywhere (e.g. the newest
+# requested day being past whatever "latest data date" AMS currently
+# has for a given report) aborted the whole DB transaction, so days
+# that HAD already succeeded were rolled back too and sync_state never
+# advanced at all. Every following run re-requested the exact same
+# (growing) window and hit the same wall. The three functions below
+# separate "AMS says this date isn't published yet" (expected, keep
+# what already succeeded, stop for now, retry next cycle) from any
+# other error (still a real, whole-call failure — unchanged from
+# before).
+AMS_DATE_NOT_READY_MARKERS = (
+    "data has not been updated",   # documented "today" rejection (pre-existing)
+    "invalid time range",          # proven live, 2026-09-23 (see report)
+    "latest data date",            # proven live, 2026-09-23 (see report)
+)
+
+
+def _is_ams_date_not_ready(message) -> bool:
+    """True only for the specific class of AMS error_param that means
+    "no data published for this date yet" — never for a real failure
+    (auth, malformed params, 429/5xx after retries, etc.), which must
+    still fail the whole call exactly as before."""
+    text = str(message or "").lower()
+    return any(marker in text for marker in AMS_DATE_NOT_READY_MARKERS)
+
+
+def _ams_compute_catchup_days(window_start, window_end, now, target_date=None):
+    """Pure — the exact day list run_affiliate_ams() used to compute
+    inline. target_date (reconciliation D-1/D-3/D-7 re-check) always
+    means exactly that one day. Otherwise: every day from the
+    incremental window_start through min(window_end, yesterday) — AMS
+    reports lag by ~1 day and reject "today" outright, so it's never
+    requested via the forward-moving incremental path."""
+    if target_date:
+        return [target_date]
+    d0 = ic.vn_date(window_start)
+    d1 = min(ic.vn_date(window_end), ic.vn_date(now) - timedelta(days=1))
+    days = []
+    d = d0
+    while d <= d1:
+        days.append(d)
+        d += timedelta(days=1)
+    return days
+
+
+def _run_ams_catchup(days, process_day, log):
+    """Pure control flow (process_day is injected — no DB/HTTP here, so
+    this is fully unit-testable). Processes days in chronological order.
+    On a "date not ready" error: stops (later days would fail the same
+    way — AMS's lag only ever moves forward), keeping every day that
+    already succeeded THIS call. Any other error propagates immediately
+    (unchanged failure behavior — e.g. a 429 that exhausted its retry
+    budget must still fail the whole call, not be silently treated as
+    partial success). Raises if zero days completed — no artificial
+    sync_state advancement over a call that made no real progress.
+
+    Returns the last successfully completed date."""
+    last_completed_date = None
+    for d in days:
+        try:
+            process_day(d)
+        except RuntimeError as e:
+            if not _is_ams_date_not_ready(str(e)):
+                raise
+            log(f"AMS date not ready yet for {d.isoformat()} ({e}) — "
+                f"stopping catch-up here, keeping {days.index(d)} earlier day(s) already written this run")
+            break
+        last_completed_date = d
+
+    if last_completed_date is None:
+        raise RuntimeError(
+            f"AMS reports not available for any requested day ({days[0]}..{days[-1]})"
+        )
+    return last_completed_date
+
+
+def _ams_effective_sync_end(days, last_completed_date):
+    """None means "full window completed, advance sync_state to
+    window_end as before". Otherwise, sync_state must advance only
+    through the end of the last day actually written — never further,
+    and never reset backward either."""
+    if not days or last_completed_date >= days[-1]:
+        return None
+    tz7 = timezone(timedelta(hours=7))
+    return datetime(
+        last_completed_date.year, last_completed_date.month, last_completed_date.day,
+        23, 59, 59, tzinfo=tz7,
+    ).astimezone(timezone.utc)
+
+
 def _ams_day_bounds_utc7(d):
     tz7 = timezone(timedelta(hours=7))
     start = int(datetime(d.year, d.month, d.day, 0, 0, 0, tzinfo=tz7).timestamp())
@@ -585,22 +679,9 @@ def run_affiliate_ams(cur, etl_run_id, shop_id, window_start, window_end, log, t
     conv_ctr = ic.Counters()
     perf_ctr = ic.Counters()
 
-    if target_date:
-        days = [target_date]
-    else:
-        # AMS reports lag by ~1 day and reject "today" with error_param
-        # ("The data has not been updated") — never request it via the
-        # forward-moving incremental path; D-1/D-3/D-7 reconciliation
-        # (target_date above) is the correct way to re-check recent days.
-        d0 = ic.vn_date(window_start)
-        d1 = min(ic.vn_date(window_end), ic.vn_date(ic.now_utc()) - timedelta(days=1))
-        days = []
-        d = d0
-        while d <= d1:
-            days.append(d)
-            d += timedelta(days=1)
+    days = _ams_compute_catchup_days(window_start, window_end, ic.now_utc(), target_date)
 
-    for d in days:
+    def process_day(d):
         start, end = _ams_day_bounds_utc7(d)
         for order in ic.with_backoff(
             lambda: list(paginate("/api/v2/ams/get_conversion_report",
@@ -727,7 +808,17 @@ def run_affiliate_ams(cur, etl_run_id, shop_id, window_start, window_end, log, t
         ):
             upsert_perf("PRODUCT", None, None, None, D(row.get("item_id")), row.get("item_name"), row)
 
-    return {"affiliate_ams_conversion": conv_ctr.as_dict(), "affiliate_ams_performance": perf_ctr.as_dict()}
+    last_completed_date = _run_ams_catchup(days, process_day, log)
+
+    result = {"affiliate_ams_conversion": conv_ctr.as_dict(), "affiliate_ams_performance": perf_ctr.as_dict()}
+    effective_sync_end = _ams_effective_sync_end(days, last_completed_date)
+    if effective_sync_end is not None:
+        # P11-HEAL — only ever set when this call stopped partway through
+        # a multi-day catch-up (see _run_ams_catchup); main() uses this
+        # instead of window_end so sync_state advances only through
+        # confirmed successful coverage, never past it.
+        result["_effective_sync_end"] = effective_sync_end
+    return result
 
 
 def run_account_health(cur, etl_run_id, shop_id, window_start, window_end, log) -> dict:
@@ -960,7 +1051,12 @@ def main() -> int:
             return 0
 
         result = HANDLERS[domain](cur, etl_run_id, shop_id, window_start, window_end, log)
-        ic.upsert_sync_state(cur, "SHOPEE", domain, shop_id, window_end, ic.vn_date(window_end), "success")
+        # P11-HEAL — a handler (currently only run_affiliate_ams) may
+        # report it only got partway through a multi-day catch-up via
+        # "_effective_sync_end"; every other domain never sets this key,
+        # so .pop(...) falls back to window_end exactly as before.
+        sync_end = result.pop("_effective_sync_end", None) or window_end
+        ic.upsert_sync_state(cur, "SHOPEE", domain, shop_id, sync_end, ic.vn_date(sync_end), "success")
         conn.commit()
         conn.close()
         print(json.dumps({"status": "PASS", "result": result}, default=str))

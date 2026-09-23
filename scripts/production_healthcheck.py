@@ -30,6 +30,48 @@ EXPECTED_TOOLS = {
     "get_affiliate_performance", "get_data_coverage",
 }
 
+# P11-HEAL — required/optional source map for STALE (and true absence)
+# classification. Explicit by BUSINESS ROLE, never inferred from row
+# counts: "required" = feeds core CM1/CM2/GM1/net_sales P&L computation
+# directly (orders, returns, settlement/finance, ad spend, affiliate
+# commission) — a required source going STALE means the numbers CEO
+# reporting / AI queries see are built on stale inputs, so it's RED.
+# "Optional" = inventory snapshots and TikTok engagement analytics
+# (product_analytics/live/shop_traffic) — useful reporting, not a P&L
+# input; STALE there is degraded but not RED. Every domain
+# mart.v_ai_source_coverage currently tracks (sql/049) must appear in
+# exactly one of these two sets — see test_healthcheck_stale_semantics.py.
+REQUIRED_SOURCES = {
+    ("SHOPEE", "orders"), ("SHOPEE", "returns"), ("SHOPEE", "finance"),
+    ("SHOPEE", "ads"), ("SHOPEE", "affiliate_ams"),
+    ("TIKTOK", "orders"), ("TIKTOK", "returns"), ("TIKTOK", "finance"), ("TIKTOK", "affiliate"),
+}
+OPTIONAL_SOURCES = {
+    ("SHOPEE", "product_inventory"), ("TIKTOK", "product_inventory"),
+    ("TIKTOK", "product_analytics"), ("TIKTOK", "live"), ("TIKTOK", "shop_traffic"),
+}
+# Statuses mart.v_ai_source_coverage (sql/049) can report that are
+# already policed by known, non-required-vs-optional policy — unchanged
+# by this fix. NOT_SETTLED_YET is kept for forward-compat with sources
+# that may report it; not currently emitted by sql/049 itself.
+KNOWN_YELLOW_STATUSES = ("SOURCE_LAGGING", "NOT_SETTLED_YET", "API_ERROR", "NO_DATA", "NOT_SCHEDULED")
+
+
+def _classify_source_status(platform: str, source: str, status: str) -> str:
+    """The finding level for one mart.v_ai_source_coverage row. CURRENT
+    is always GREEN. The known lag/external-error statuses stay YELLOW
+    exactly as before. STALE escalates to RED only for a REQUIRED
+    source — for an OPTIONAL source it's YELLOW (degraded, not a P&L
+    correctness problem). Any other, unrecognized status is still RED
+    — fail-closed, unchanged from before this fix."""
+    if status == "CURRENT":
+        return "GREEN"
+    if status in KNOWN_YELLOW_STATUSES:
+        return "YELLOW"
+    if status == "STALE":
+        return "RED" if (platform, source) in REQUIRED_SOURCES else "YELLOW"
+    return "RED"
+
 
 def get_conn():
     # Phase 6C scheduler-migration — env var (GitHub Secret) takes
@@ -64,21 +106,31 @@ def check_database(findings: list[tuple[str, str, str]]):
     findings.append(("GREEN", "LATEST_GOLD_DATE", str(gold_latest)))
     findings.append(("GREEN", "LATEST_MART_DATE_WITH_NET_SALES", str(mart_latest)))
 
-    # 3. Source coverage / freshness — flag API_ERROR as YELLOW (external,
-    #    not RED — matches MONITORING_AND_ALERT_RULES_V1.md), SOURCE_LAGGING
-    #    as YELLOW, anything else unexpected as RED.
+    # 3. Source coverage / freshness — see _classify_source_status():
+    #    CURRENT is GREEN, known lag/external-error statuses stay
+    #    YELLOW, STALE is RED only for a REQUIRED (P&L-critical) source
+    #    and YELLOW for an OPTIONAL one, anything else unrecognized is
+    #    still RED (fail-closed).
     cur.execute(
         "SELECT platform, source_name, coverage_status, latest_db_date, last_error_message "
         "FROM mart.v_ai_source_coverage ORDER BY 1,2;"
     )
-    for platform, source, status, latest_date, err in cur.fetchall():
+    rows = cur.fetchall()
+    seen_sources = set()
+    for platform, source, status, latest_date, err in rows:
+        seen_sources.add((platform, source))
         label = f"SOURCE[{platform}.{source}]"
-        if status in ("CURRENT",):
-            findings.append(("GREEN", label, f"{status} latest={latest_date}"))
-        elif status in ("SOURCE_LAGGING", "NOT_SETTLED_YET", "API_ERROR", "NO_DATA", "NOT_SCHEDULED"):
-            findings.append(("YELLOW", label, f"{status} latest={latest_date} err={err}"))
-        else:
-            findings.append(("RED", label, f"UNEXPECTED_STATUS={status}"))
+        level = _classify_source_status(platform, source, status)
+        detail = f"{status} latest={latest_date}" if level == "GREEN" else f"{status} latest={latest_date} err={err}"
+        if level == "RED" and status not in KNOWN_YELLOW_STATUSES and status != "STALE":
+            detail = f"UNEXPECTED_STATUS={status}"
+        findings.append((level, label, detail))
+
+    # A REQUIRED source missing from the view entirely (config drift,
+    # not a data-freshness problem) is a structural RED — never
+    # silently converted to zero/absent.
+    for platform, source in sorted(REQUIRED_SOURCES - seen_sources):
+        findings.append(("RED", f"SOURCE[{platform}.{source}]", "MISSING_REQUIRED_SOURCE: not present in mart.v_ai_source_coverage"))
 
     # 4. Gold exceptions (COGS) — 0 expected per last _p6a_gold_build.py run
     cur.execute(
