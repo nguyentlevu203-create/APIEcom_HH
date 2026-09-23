@@ -245,6 +245,58 @@ def simple_log(prefix: str):
 
 
 # ---------------------------------------------------------------------
+# P11-SEXTUS — domain-status/verdict semantics, shared by
+# pipelines/incremental.py (which produces per-domain results) and
+# scripts/run_production_cycle.py (which must not let a due domain's
+# real failure disappear behind a green subprocess exit code).
+# ---------------------------------------------------------------------
+
+# Only the status strings run_domain()/run_tiktok_ads_skip() (and the
+# "no shop_id" branch in incremental.py's main()) actually produce as of
+# this checkpoint. Deliberately NOT including a "NO_DATA_DUE" status —
+# no current code path emits it. Anything not in this set — including a
+# status this code has never produced before — is treated as a domain
+# failure: fail-closed, an allowlist rather than a denylist.
+REQUIRED_OK_STATUSES = {"PASS", "NOT_DUE", "NO_PERMISSION / SEPARATE_ADS_API"}
+
+
+def is_domain_ok(status: Optional[str]) -> bool:
+    return status in REQUIRED_OK_STATUSES
+
+
+def classify_domain_error(domain_result: dict) -> Optional[str]:
+    """Best-effort error_class for observability/logging only. Never
+    feeds back into the PASS/FAIL decision — that's is_domain_ok() alone,
+    based on the actual "status" field the domain result already
+    carries. Returns None for a domain that isn't a failure at all."""
+    if is_domain_ok(domain_result.get("status")):
+        return None
+    error = str(domain_result.get("error") or "")
+    if "DOMAIN_WORKER_TIMEOUT" in error:
+        return "DOMAIN_WORKER_TIMEOUT"
+    if "429" in error:
+        return "SOURCE_RATE_LIMITED"
+    return "SOURCE_FAILURE"
+
+
+def compute_ingestion_verdict(results: dict) -> dict:
+    """Pure aggregation over incremental.py's already-built per-domain
+    results dict (built by main()'s existing per-domain loop, which is
+    completely untouched and keeps running every domain regardless of
+    an earlier one's outcome). This only decides, once every domain has
+    already had its turn, whether the process as a whole should report
+    success or failure."""
+    failed_domains = sorted(
+        domain for domain, result in results.items()
+        if not is_domain_ok(result.get("status"))
+    )
+    return {
+        "process_status": "FAIL" if failed_domains else "PASS",
+        "failed_domains": failed_domains,
+    }
+
+
+# ---------------------------------------------------------------------
 # Sync-state helpers
 # ---------------------------------------------------------------------
 

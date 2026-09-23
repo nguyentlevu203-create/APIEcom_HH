@@ -186,6 +186,80 @@ def run_subprocess(label: str, args: list[str], cwd: Path, timeout: float) -> di
     }
 
 
+INCREMENTAL_RESULT_MARKER = "HH_INCREMENTAL_RESULT_JSON="
+
+
+def parse_incremental_marker(stdout: str) -> dict | None:
+    """P11-SEXTUS Q3/Q9 — the only accepted way to read
+    pipelines/incremental.py's machine-readable verdict: its exact
+    'HH_INCREMENTAL_RESULT_JSON=' line, read from FULL subprocess
+    stdout (never a bounded tail, which can silently drop this line
+    once a run's combined output exceeds the tail length — proven
+    fragile at 4KB with the old "find the first '{'" approach). No
+    regex guessing, no dependence on tail length: exact line prefix,
+    last match wins if it ever appeared more than once, and any parse
+    failure returns None so the caller can fail closed instead of
+    guessing."""
+    for line in reversed(stdout.splitlines()):
+        if line.startswith(INCREMENTAL_RESULT_MARKER):
+            try:
+                return json.loads(line[len(INCREMENTAL_RESULT_MARKER):])
+            except (json.JSONDecodeError, ValueError):
+                return None
+    return None
+
+
+def compute_cycle_verdict(ingestion: dict, gold_steps: list, recon: dict, healthcheck_overall: str) -> tuple[str, list]:
+    """P11-SEXTUS Q5/Q6/Q7 — pure aggregation, no subprocess/DB access,
+    so it's directly unit-testable against synthesized stage results.
+
+    RED if: the ingestion PROCESS itself failed/timed out/excepted or
+    its own machine result reports a required domain failed, OR any
+    Gold step failed, OR reconciliation failed/timed out, OR healthcheck
+    is RED. A later reconciliation PASS never erases an ingestion
+    domain failure (Q6) — reconciliation is a recovery/verification
+    path, not proof the normal incremental path succeeded, so both are
+    checked independently and either alone can force RED.
+
+    Healthcheck-only YELLOW (e.g. COGS_UNRESOLVED_LINES, MCP live-check
+    skipped on a runner) may still leave the cycle GREEN-adjacent at
+    YELLOW/exit-0 — those are existing, non-blocking healthcheck
+    semantics, unchanged by this checkpoint."""
+    reasons: list[str] = []
+
+    if ingestion["status"] in ("TIMEOUT", "EXCEPTION"):
+        reasons.append(f"INGESTION_PROCESS_{ingestion['status']}")
+    elif ingestion.get("ingestion_process_status") == "INGESTION_RESULT_UNPARSEABLE":
+        reasons.append("INGESTION_RESULT_UNPARSEABLE")
+    elif ingestion["status"] == "FAILED" and not ingestion.get("ingestion_failed_domains"):
+        # Process exited non-zero (or returned an internally
+        # inconsistent marker) with no per-domain explanation — still a
+        # real process-level failure; fail closed rather than assume
+        # the missing detail means nothing due actually failed.
+        reasons.append("INGESTION_PROCESS_FAILED")
+
+    for domain in ingestion.get("ingestion_failed_domains", []):
+        reasons.append(f"INGESTION_DOMAIN_FAILURE:{domain}")
+
+    for step in gold_steps:
+        if step["status"] != "SUCCESS":
+            reasons.append(f"GOLD_STEP_FAILURE:{step['label']}")
+
+    if recon["status"] != "SUCCESS":
+        reasons.append(f"RECONCILIATION_{recon['status']}")
+
+    if healthcheck_overall == "RED":
+        reasons.append("HEALTHCHECK_RED")
+
+    if reasons:
+        return "RED", reasons
+    if healthcheck_overall == "YELLOW":
+        return "YELLOW", reasons
+    if healthcheck_overall == "GREEN":
+        return "GREEN", reasons
+    return "YELLOW", reasons  # unknown healthcheck output — conservative, never claim GREEN blindly
+
+
 def finalize_orphaned_running_rows(cycle_started_at: str, reason: str) -> int:
     """P11-TER.5 — after this cycle's own ingestion/reconciliation
     subprocess is timeout-killed, any control.etl_run_log row still
@@ -214,21 +288,73 @@ def finalize_orphaned_running_rows(cycle_started_at: str, reason: str) -> int:
 
 
 def run_ingestion() -> dict:
-    """API -> CORE. Per-domain isolated inside incremental.py itself."""
-    result = run_subprocess(
-        "incremental_ingestion", [PY, "pipelines/incremental.py"], ROOT, INGESTION_TIMEOUT_SECONDS,
-    )
-    per_domain = {}
-    if result["stdout_tail"]:
-        try:
-            # incremental.py prints one JSON object with a result per "CHANNEL/domain" key.
-            start = result["stdout_tail"].find("{")
-            if start >= 0:
-                per_domain = json.loads(result["stdout_tail"][start:])
-        except Exception:  # noqa: BLE001
-            per_domain = {}
-    result["per_domain"] = per_domain
-    return result
+    """API -> CORE. Per-domain isolated inside incremental.py itself.
+
+    P11-SEXTUS — reads incremental.py's verdict from its explicit
+    HH_INCREMENTAL_RESULT_JSON= marker line on FULL subprocess stdout
+    (see parse_incremental_marker()), not the bounded stdout_tail
+    run_subprocess() uses for other stages — a real domain failure must
+    never disappear just because combined stdout got truncated for
+    storage. Falls back to run_contained_subprocess() directly (the
+    same primitive run_subprocess() wraps) rather than reusing that
+    generic wrapper, since this stage alone needs the untruncated
+    stdout to parse."""
+    started_at = now_iso()
+    try:
+        r, timed_out = ic.run_contained_subprocess(
+            [PY, "pipelines/incremental.py"], ROOT, INGESTION_TIMEOUT_SECONDS,
+        )
+    except Exception as e:  # noqa: BLE001
+        return {
+            "label": "incremental_ingestion", "started_at": started_at, "finished_at": now_iso(),
+            "status": "EXCEPTION", "returncode": None, "stdout_tail": None, "stderr_tail": str(e),
+            "ingestion_process_status": "EXCEPTION",
+            "ingestion_domain_results": {}, "ingestion_failed_domains": [], "per_domain": {},
+        }
+
+    finished_at = now_iso()
+    full_stdout = r.stdout or ""
+    base = {
+        "label": "incremental_ingestion", "started_at": started_at, "finished_at": finished_at,
+        "returncode": r.returncode,
+        "stdout_tail": full_stdout[-4000:],
+        "stderr_tail": (r.stderr or "")[-2000:] if r.returncode != 0 else None,
+    }
+
+    if timed_out:
+        base.update({
+            "status": "TIMEOUT", "ingestion_process_status": "TIMEOUT",
+            "ingestion_domain_results": {}, "ingestion_failed_domains": [], "per_domain": {},
+        })
+        return base
+
+    marker = parse_incremental_marker(full_stdout)
+    if marker is None:
+        # Q9 — never assume success from missing observability.
+        base.update({
+            "status": "FAILED", "ingestion_process_status": "INGESTION_RESULT_UNPARSEABLE",
+            "ingestion_domain_results": {}, "ingestion_failed_domains": [], "per_domain": {},
+        })
+        return base
+
+    domains = marker.get("domains", {}) or {}
+    failed_domains = marker.get("failed_domains", []) or []
+    marker_status = marker.get("process_status", "FAIL" if failed_domains else "PASS")
+    ok = (r.returncode == 0) and marker_status == "PASS" and not failed_domains
+    base.update({
+        "status": "SUCCESS" if ok else "FAILED",
+        "ingestion_process_status": marker_status if r.returncode == 0 else "PROCESS_EXIT_NONZERO",
+        # Sanitized for the persisted log (Q7): status + best-effort
+        # error_class only, never the raw error/exception text a domain
+        # result may carry.
+        "ingestion_domain_results": {
+            domain: {"status": result.get("status"), "error_class": ic.classify_domain_error(result)}
+            for domain, result in domains.items()
+        },
+        "ingestion_failed_domains": failed_domains,
+        "per_domain": domains,
+    })
+    return base
 
 
 def run_gold_chain() -> list[dict]:
@@ -292,7 +418,9 @@ def main():
     print("--- STEP 1: API -> CORE (incremental ingestion) ---")
     ingestion = run_ingestion()
     log["ingestion"] = ingestion
-    print(f"ingestion status: {ingestion['status']}")
+    print(f"ingestion status: {ingestion['status']} (process: {ingestion.get('ingestion_process_status')})")
+    if ingestion.get("ingestion_failed_domains"):
+        print(f"  failed domain(s): {', '.join(ingestion['ingestion_failed_domains'])}")
     if ingestion["status"] == "TIMEOUT":
         # P11-TER.5 — we just terminated incremental.py's whole process
         # group (see run_contained_subprocess), so any row it started
@@ -332,11 +460,16 @@ def main():
         log["healthcheck"] = {"label": "production_healthcheck", "status": "EXCEPTION", "error": str(e)}
         print(f"healthcheck EXCEPTION: {e}")
 
-    # Overall cycle verdict:
-    # RED   = any internal Gold-chain script FAILED/TIMEOUT/EXCEPTION, or healthcheck overall RED
-    # YELLOW = ingestion had per-domain failures that are known external issues (e.g. Shopee returns),
-    #          or healthcheck overall YELLOW, but no internal Gold/reconciliation failure
-    # GREEN  = everything succeeded
+    # Overall cycle verdict — see compute_cycle_verdict() docstring
+    # (P11-SEXTUS): RED if the ingestion process itself failed/timed
+    # out/excepted OR any required due ingestion domain failed OR any
+    # Gold step failed OR reconciliation failed/timed out OR healthcheck
+    # is RED; otherwise YELLOW/GREEN follows healthcheck alone. Before
+    # this checkpoint, a due domain's real ingestion failure (e.g.
+    # Shopee AMS 429, TikTok orders timeout — both proven live in run
+    # 35714248327) was never factored into this verdict at all, so
+    # GitHub could report `success` while a due domain had actually
+    # failed.
     gold_failed = any(s["status"] != "SUCCESS" for s in gold_steps)
     healthcheck_overall = "UNKNOWN"
     if isinstance(log.get("healthcheck"), dict) and "stdout" in log["healthcheck"]:
@@ -344,24 +477,24 @@ def main():
             if line.startswith("OVERALL:"):
                 healthcheck_overall = line.split(":", 1)[1].strip()
 
-    if gold_failed or recon["status"] not in ("SUCCESS",) or healthcheck_overall == "RED":
-        verdict = "RED"
-    elif healthcheck_overall == "YELLOW":
-        verdict = "YELLOW"
-    elif healthcheck_overall == "GREEN":
-        verdict = "GREEN"
-    else:
-        verdict = "YELLOW"  # unknown healthcheck output — be conservative, never claim GREEN blindly
+    verdict, cycle_exit_reason = compute_cycle_verdict(ingestion, gold_steps, recon, healthcheck_overall)
 
     log["cycle_finished_at"] = now_iso()
     log["cycle_verdict"] = verdict
+    log["cycle_exit_reason"] = cycle_exit_reason
     log["gold_chain_all_success"] = not gold_failed
     log["healthcheck_overall"] = healthcheck_overall
+    log["ingestion_process_status"] = ingestion.get("ingestion_process_status")
+    log["ingestion_domain_results"] = ingestion.get("ingestion_domain_results", {})
+    log["ingestion_failed_domains"] = ingestion.get("ingestion_failed_domains", [])
+    log["ingestion_required_failure_count"] = len(ingestion.get("ingestion_failed_domains", []))
 
     log_path = LOG_DIR / f"cycle_{cycle_started_at.replace(':', '-')}.json"
     log_path.write_text(json.dumps(log, indent=2, default=str))
 
     print(f"=== PRODUCTION CYCLE END — VERDICT: {verdict} ===")
+    if cycle_exit_reason:
+        print(f"  reasons: {', '.join(cycle_exit_reason)}")
     print(f"Log written to {log_path}")
     return 0 if verdict != "RED" else 1
 

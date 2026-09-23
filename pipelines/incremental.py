@@ -227,7 +227,20 @@ def main() -> int:
         results["TIKTOK/ads"] = run_tiktok_ads_skip()
 
     print(json.dumps(results, indent=2, default=str))
-    return 0
+
+    # P11-SEXTUS Q2/Q3 — a due domain failing here used to be silently
+    # absorbed: this process always returned 0 and its caller
+    # (scripts/run_production_cycle.py) never even looked past a bounded
+    # stdout tail. Print one explicit, single-line, machine-readable
+    # marker with the full per-domain verdict, and exit non-zero when
+    # any required domain actually failed — domain isolation above is
+    # untouched (every domain still runs regardless of an earlier one's
+    # outcome); this only changes what the PROCESS reports once they all
+    # have.
+    verdict = ic.compute_ingestion_verdict(results)
+    marker_payload = {"domains": results, **verdict}
+    print(f"HH_INCREMENTAL_RESULT_JSON={json.dumps(marker_payload, default=str)}")
+    return 1 if verdict["process_status"] == "FAIL" else 0
 
 
 if __name__ == "__main__":
