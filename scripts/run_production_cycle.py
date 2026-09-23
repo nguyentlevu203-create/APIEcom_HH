@@ -186,6 +186,63 @@ def run_subprocess(label: str, args: list[str], cwd: Path, timeout: float) -> di
     }
 
 
+RECON_DOMAIN_TIMING_MARKER = "HH_RECON_DOMAIN_TIMING_JSON="
+RECON_WINDOW_START_MARKER = "HH_RECON_WINDOW_START_JSON="
+RECON_WINDOW_END_MARKER = "HH_RECON_WINDOW_END_JSON="
+RECON_RESULT_MARKER = "HH_RECONCILIATION_RESULT_JSON="
+
+
+def parse_recon_timing_markers(stdout: str) -> dict:
+    """P11-RECON-OBS — reads every timing marker pipelines/reconcile.py
+    flushes as it goes (print(..., flush=True) on each one), from FULL
+    subprocess stdout — never a bounded tail. reconcile.py can itself be
+    killed by this stage's own RECONCILIATION_TIMEOUT_SECONDS before it
+    ever prints a final HH_RECONCILIATION_RESULT_JSON= summary; every
+    HH_RECON_DOMAIN_TIMING_JSON=/WINDOW_START/WINDOW_END marker already
+    flushed before that kill is still present in the subprocess's
+    captured stdout (Python's subprocess.communicate() never drops
+    output collected before a TimeoutExpired, even across the
+    retry-after-SIGTERM/SIGKILL calls incr_common.run_contained_
+    subprocess() makes) — this is what lets a TIMEOUT still carry
+    partial per-domain timing instead of losing it entirely. A single
+    linear pass, in stdout order, so `last_window` reflects whichever
+    window the process was actually working on when it stopped."""
+    domain_timings: list[dict] = []
+    window_ends: list[dict] = []
+    final_summary = None
+    last_window = None
+    for line in stdout.splitlines():
+        if line.startswith(RECON_DOMAIN_TIMING_MARKER):
+            try:
+                domain_timings.append(json.loads(line[len(RECON_DOMAIN_TIMING_MARKER):]))
+            except (json.JSONDecodeError, ValueError):
+                pass
+        elif line.startswith(RECON_WINDOW_START_MARKER):
+            try:
+                payload = json.loads(line[len(RECON_WINDOW_START_MARKER):])
+                last_window = payload.get("window")
+            except (json.JSONDecodeError, ValueError):
+                pass
+        elif line.startswith(RECON_WINDOW_END_MARKER):
+            try:
+                payload = json.loads(line[len(RECON_WINDOW_END_MARKER):])
+                window_ends.append(payload)
+                last_window = payload.get("window")
+            except (json.JSONDecodeError, ValueError):
+                pass
+        elif line.startswith(RECON_RESULT_MARKER):
+            try:
+                final_summary = json.loads(line[len(RECON_RESULT_MARKER):])
+            except (json.JSONDecodeError, ValueError):
+                pass
+    return {
+        "domain_timings": domain_timings,
+        "completed_windows": [w.get("window") for w in window_ends],
+        "last_window": last_window,
+        "final_summary": final_summary,
+    }
+
+
 INCREMENTAL_RESULT_MARKER = "HH_INCREMENTAL_RESULT_JSON="
 
 
@@ -367,10 +424,50 @@ def run_gold_chain() -> list[dict]:
 
 
 def run_reconciliation() -> dict:
-    return run_subprocess(
-        "reconciliation (D-1/D-3/D-7 re-check)", [PY, "pipelines/reconcile.py"], ROOT,
-        RECONCILIATION_TIMEOUT_SECONDS,
-    )
+    """D-1/D-3/D-7 re-check across all domains.
+
+    P11-RECON-OBS — reads FULL subprocess stdout (never the bounded
+    tail) to preserve reconcile.py's per-domain timing markers even
+    when this stage hits RECONCILIATION_TIMEOUT_SECONDS and the
+    subprocess gets killed mid-run — a TIMEOUT still carries every
+    domain's timing that was flushed before the kill, giving real
+    evidence for where the 3600s budget actually goes instead of
+    another guess."""
+    label = "reconciliation (D-1/D-3/D-7 re-check)"
+    started_at = now_iso()
+    try:
+        r, timed_out = ic.run_contained_subprocess(
+            [PY, "pipelines/reconcile.py"], ROOT, RECONCILIATION_TIMEOUT_SECONDS,
+        )
+    except Exception as e:  # noqa: BLE001
+        return {
+            "label": label, "started_at": started_at, "finished_at": now_iso(),
+            "status": "EXCEPTION", "returncode": None, "stdout_tail": None, "stderr_tail": str(e),
+            "reconciliation_elapsed_seconds": None, "reconciliation_completed_domains": 0,
+            "reconciliation_domain_timings": [], "reconciliation_completed_windows": [],
+            "reconciliation_last_window": None, "reconciliation_slowest_completed_domains": [],
+        }
+
+    finished_at = now_iso()
+    full_stdout = r.stdout or ""
+    parsed = parse_recon_timing_markers(full_stdout)
+    domain_timings = parsed["domain_timings"]
+    slowest = sorted(domain_timings, key=lambda t: t.get("duration_seconds", 0), reverse=True)[:5]
+
+    status = "TIMEOUT" if timed_out else ("SUCCESS" if r.returncode == 0 else "FAILED")
+    return {
+        "label": label, "started_at": started_at, "finished_at": finished_at,
+        "status": status, "returncode": r.returncode,
+        "stdout_tail": full_stdout[-4000:], "stderr_tail": (r.stderr or "")[-2000:] if r.returncode != 0 else None,
+        "reconciliation_elapsed_seconds": (
+            datetime.fromisoformat(finished_at) - datetime.fromisoformat(started_at)
+        ).total_seconds(),
+        "reconciliation_completed_domains": len(domain_timings),
+        "reconciliation_domain_timings": domain_timings,
+        "reconciliation_completed_windows": parsed["completed_windows"],
+        "reconciliation_last_window": parsed["last_window"],
+        "reconciliation_slowest_completed_domains": slowest,
+    }
 
 
 def run_source_coverage_snapshot() -> dict:
@@ -437,7 +534,19 @@ def main():
     print("--- STEP 3: reconciliation ---")
     recon = run_reconciliation()
     log["reconciliation"] = recon
-    print(f"reconciliation status: {recon['status']}")
+    # P11-RECON-OBS — promoted to top-level log fields, same pattern as
+    # the ingestion_* fields above: survives even a TIMEOUT, since
+    # run_reconciliation() reads these off FULL stdout regardless of
+    # how the subprocess ended.
+    log["reconciliation_elapsed_seconds"] = recon.get("reconciliation_elapsed_seconds")
+    log["reconciliation_completed_domains"] = recon.get("reconciliation_completed_domains")
+    log["reconciliation_domain_timings"] = recon.get("reconciliation_domain_timings", [])
+    log["reconciliation_completed_windows"] = recon.get("reconciliation_completed_windows", [])
+    log["reconciliation_last_window"] = recon.get("reconciliation_last_window")
+    log["reconciliation_slowest_completed_domains"] = recon.get("reconciliation_slowest_completed_domains", [])
+    print(f"reconciliation status: {recon['status']} "
+          f"(completed {recon.get('reconciliation_completed_domains')} domain(s), "
+          f"last window touched: {recon.get('reconciliation_last_window')})")
     if recon["status"] == "TIMEOUT":
         n = finalize_orphaned_running_rows(cycle_started_at, "ORCHESTRATOR_TIMEOUT")
         print(f"finalized {n} orphaned etl_run_log row(s) from this cycle's reconciliation timeout")

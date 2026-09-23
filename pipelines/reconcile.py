@@ -38,6 +38,7 @@ import argparse
 import json
 import subprocess
 import sys
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -87,7 +88,47 @@ def get_shop_ids() -> dict:
     return {"SHOPEE": shopee_shop_id, "TIKTOK": tiktok_shop_id}
 
 
-def run_reconcile_domain(source_system: str, domain: str, shop_id: str, business_date) -> dict:
+RECON_DOMAIN_TIMING_MARKER = "HH_RECON_DOMAIN_TIMING_JSON="
+RECON_WINDOW_START_MARKER = "HH_RECON_WINDOW_START_JSON="
+RECON_WINDOW_END_MARKER = "HH_RECON_WINDOW_END_JSON="
+RECON_RESULT_MARKER = "HH_RECONCILIATION_RESULT_JSON="
+
+
+def _emit_domain_timing(window_label: str, business_date, source_system: str, domain: str,
+                         result: dict, duration_seconds: float, timed_out: bool, sink: list | None = None) -> dict:
+    """P11-RECON-OBS — one flushed marker line per domain, immediately
+    after it finishes. This process can itself be killed by the outer
+    orchestrator's 3600s stage timeout (proven live, 2026-09-23) before
+    it ever reaches the final summary — flushing here, per domain, is
+    what lets already-completed timing survive that kill instead of
+    being lost with the rest of the process's buffered state. Reuses
+    incr_common.classify_domain_error() for a safe, non-secret-bearing
+    error class — never the raw exception/error text. `sink`, when
+    given, also collects this same payload for main()'s final summary —
+    never recomputed differently, always the exact thing that was
+    flushed."""
+    rows_processed = len(result.get("recon_rows") or []) if result.get("status") == "PASS" else 0
+    payload = {
+        "window": window_label,
+        "business_date": business_date.isoformat(),
+        "source_system": source_system,
+        "domain": domain,
+        "status": result.get("status"),
+        "duration_seconds": round(duration_seconds, 3),
+        "timed_out": timed_out,
+        "rows_processed": rows_processed,
+        "etl_run_id": result.get("etl_run_id"),
+        "error_class": ic.classify_domain_error(result),
+    }
+    print(f"{RECON_DOMAIN_TIMING_MARKER}{json.dumps(payload, default=str)}", flush=True)
+    if sink is not None:
+        sink.append(payload)
+    return payload
+
+
+def run_reconcile_domain(window_label: str, source_system: str, domain: str, shop_id: str, business_date,
+                          timings_sink: list | None = None) -> dict:
+    t0 = time.monotonic()
     window_start, window_end = day_window_utc(business_date)
 
     conn = ic.get_db_conn()
@@ -120,11 +161,14 @@ def run_reconcile_domain(source_system: str, domain: str, shop_id: str, business
         # isolated FAIL and the loop continues to the next domain.
         error = f"DOMAIN_WORKER_TIMEOUT: worker exceeded {recon_timeout}s, process group terminated"
         ic.finish_run_log(source_system, domain, etl_run_id, "fail", 0, error)
-        return {
+        result = {
             "status": "FAIL", "business_date": business_date.isoformat(),
             "window_start": window_start.isoformat(), "window_end": window_end.isoformat(),
             "etl_run_id": etl_run_id, "error": error,
         }
+        _emit_domain_timing(window_label, business_date, source_system, domain, result,
+                             time.monotonic() - t0, timed_out=True, sink=timings_sink)
+        return result
 
     worker_result = None
     for line in reversed(proc.stdout.strip().splitlines()):
@@ -137,20 +181,26 @@ def run_reconcile_domain(source_system: str, domain: str, shop_id: str, business
     if proc.returncode == 0 and worker_result and worker_result.get("status") == "PASS":
         rows_processed = len(worker_result.get("recon_rows") or [])
         ic.finish_run_log(source_system, domain, etl_run_id, "success", rows_processed)
-        return {
+        result = {
             "status": "PASS", "business_date": business_date.isoformat(),
             "window_start": window_start.isoformat(), "window_end": window_end.isoformat(),
             "etl_run_id": etl_run_id, "recon_rows": worker_result.get("recon_rows"),
             "worker_result": worker_result.get("result"),
         }
+        _emit_domain_timing(window_label, business_date, source_system, domain, result,
+                             time.monotonic() - t0, timed_out=False, sink=timings_sink)
+        return result
 
     error = (worker_result or {}).get("error") or proc.stderr[-2000:] or f"worker exit code {proc.returncode}"
     ic.finish_run_log(source_system, domain, etl_run_id, "fail", 0, error)
-    return {
+    result = {
         "status": "FAIL", "business_date": business_date.isoformat(),
         "window_start": window_start.isoformat(), "window_end": window_end.isoformat(),
         "etl_run_id": etl_run_id, "error": error,
     }
+    _emit_domain_timing(window_label, business_date, source_system, domain, result,
+                         time.monotonic() - t0, timed_out=False, sink=timings_sink)
+    return result
 
 
 def main() -> int:
@@ -181,20 +231,63 @@ def main() -> int:
     shop_ids = get_shop_ids()
     results: dict = {"TODAY_HH": today.isoformat(), "dates": {k: v.isoformat() for k, v in dates.items()}}
 
+    overall_t0 = time.monotonic()
+    all_domain_timings: list[dict] = []
+    window_timings: list[dict] = []
+
     for window_label, business_date in dates.items():
         results[window_label] = {}
+        window_t0 = time.monotonic()
+        print(f"{RECON_WINDOW_START_MARKER}"
+              f"{json.dumps({'window': window_label, 'business_date': business_date.isoformat()}, default=str)}",
+              flush=True)
+        completed_count = 0
+        failed_count = 0
         for source_system, domains in (("SHOPEE", SHOPEE_RECON_DOMAINS), ("TIKTOK", TIKTOK_RECON_DOMAINS)):
             shop_id = shop_ids.get(source_system)
             if not shop_id:
                 results[window_label][source_system] = {"status": "FAIL", "error": f"no shop_id for {source_system}"}
+                failed_count += 1
                 continue
             for domain in domains:
                 if only and (source_system, domain) not in only:
                     continue
                 key = f"{source_system}/{domain}"
-                results[window_label][key] = run_reconcile_domain(source_system, domain, shop_id, business_date)
+                domain_result = run_reconcile_domain(
+                    window_label, source_system, domain, shop_id, business_date, timings_sink=all_domain_timings,
+                )
+                results[window_label][key] = domain_result
+                if domain_result.get("status") == "PASS":
+                    completed_count += 1
+                else:
+                    failed_count += 1
+
+        window_end_payload = {
+            "window": window_label, "business_date": business_date.isoformat(),
+            "elapsed_seconds": round(time.monotonic() - window_t0, 3),
+            "completed_domain_count": completed_count, "failed_domain_count": failed_count,
+        }
+        print(f"{RECON_WINDOW_END_MARKER}{json.dumps(window_end_payload, default=str)}", flush=True)
+        window_timings.append(window_end_payload)
 
     print(json.dumps(results, indent=2, default=str))
+
+    # P11-RECON-OBS Q4 — bounded, structured summary; never duplicates
+    # full worker stdout. domain_timings here are the exact same
+    # payloads _emit_domain_timing() already flushed per domain via
+    # timings_sink, not recomputed differently.
+    total_success = sum(1 for t in all_domain_timings if t["status"] == "PASS")
+    slowest = sorted(all_domain_timings, key=lambda t: t["duration_seconds"], reverse=True)[:5]
+    summary = {
+        "total_elapsed_seconds": round(time.monotonic() - overall_t0, 3),
+        "total_domains_attempted": len(all_domain_timings),
+        "total_domains_success": total_success,
+        "total_domains_failed": len(all_domain_timings) - total_success,
+        "window_timings": window_timings,
+        "domain_timings": all_domain_timings,
+        "slowest_domains": slowest,
+    }
+    print(f"{RECON_RESULT_MARKER}{json.dumps(summary, default=str)}", flush=True)
     return 0
 
 
