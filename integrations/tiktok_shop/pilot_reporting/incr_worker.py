@@ -57,39 +57,51 @@ def _label() -> str:
     return f"incr_{ic.now_utc().strftime('%Y%m%dT%H%M%S')}"
 
 
-# P11-HEAL — TikTok/orders backlog chunking.
+# P11-HEAL / P11-LAST-MILE — TikTok/orders backlog catch-up.
 #
-# Proven live (repeatedly, most recently 2026-09-23): once sync_state
-# falls behind by several days, run_orders() used to fetch and write
-# the ENTIRE backlog window in one pass, inside one transaction, with
-# no internal time awareness — the orchestrator's external
-# TIKTOK_ORDERS_TIMEOUT_SECONDS=900 (pipelines/incremental.py) then
-# SIGTERM/SIGKILLs the whole process group mid-run, which loses
-# everything (an open, uncommitted transaction dies with the
-# connection) and never advances sync_state at all — so the backlog
-# never shrinks and every following run repeats the exact same
-# ever-growing window. Splitting into bounded chunks, each committed as
-# a group via one final commit gated on chunk-level success (mirroring
-# Shopee AMS's _run_ams_catchup below), means a run that still can't
-# finish everything at least keeps whatever chunks it DID complete, and
-# the backlog shrinks monotonically run over run instead of resetting.
-TIKTOK_ORDERS_CHUNK_SIZE = timedelta(days=1)
+# Proven live (runs 35816592219 and 35832785885, 2026-09-23): both runs
+# started TikTok/orders at the exact same watermark
+# (2026-09-17T09:57:12Z) and both ended DOMAIN_WORKER_TIMEOUT at 900s —
+# zero durable progress. P11-HEAL had split the backlog into 1-day
+# chunks, but every chunk still wrote into ONE transaction committed
+# once at the very end by main(), so pipelines/incremental.py's external
+# TIKTOK_ORDERS_TIMEOUT_SECONDS=900 SIGTERM/SIGKILL still rolled back
+# every chunk that had already finished (the open transaction dies with
+# the connection). And a single 24h chunk was itself not safely bounded
+# below 900s.
+#
+# P11-LAST-MILE fix: each chunk is its own durable transaction on a
+# fresh connection — fetch (API only, no DB held open across slow API
+# calls — see the Neon connection-reliability note in incr_common),
+# then write + advance control.etl_sync_state to exactly chunk_end +
+# COMMIT, then emit a progress marker. A later failure or an external
+# kill can only ever lose the chunk in flight, never an earlier one.
+# Reconciliation reuses the same fetch/write logic via run_orders()
+# over its single-day window, WITHOUT ever touching sync_state.
+TIKTOK_ORDERS_CHUNK_SIZE = timedelta(hours=4)
 # Self-imposed internal soft deadline — must stay comfortably below
 # pipelines/incremental.py's TIKTOK_ORDERS_TIMEOUT_SECONDS=900 external
 # kill, leaving margin for whatever chunk is in flight when the
 # deadline is checked (chunks are never aborted mid-flight, only
-# skipped before they start) plus the final DB commit. See
-# scripts/test_run_production_cycle_timeouts.py-style cross-file
-# invariant in test_orders_catchup.py.
+# skipped before they start). Cross-file invariant pinned in
+# test_orders_catchup.py.
 TIKTOK_ORDERS_CHUNK_DEADLINE_SECONDS = 780
+
+TIKTOK_ORDERS_CHUNK_MARKER = "HH_TIKTOK_ORDERS_CHUNK_JSON="
+TIKTOK_ORDERS_CATCHUP_MARKER = "HH_TIKTOK_ORDERS_CATCHUP_JSON="
+
+ORDERS_STATUS_PASS = "PASS"
+ORDERS_STATUS_PARTIAL = ic.PARTIAL_CATCHUP_STATUS
+ORDERS_STATUS_FAIL = "FAIL"
 
 
 def _tiktok_orders_compute_chunks(window_start, window_end, chunk_size=TIKTOK_ORDERS_CHUNK_SIZE):
     """Pure — splits [window_start, window_end) into chunk_size-sized
-    sub-windows, chronological order, no gaps or overlaps, last chunk
-    may be shorter. A normal steady-state incremental window (30min
-    cadence, always << chunk_size) always yields exactly one chunk
-    spanning the whole window — identical behavior to before this fix."""
+    sub-windows, chronological order, no gaps or overlaps, exact
+    timestamps (never rounded to dates), last chunk may be shorter. A
+    normal steady-state incremental window (30min cadence, always <<
+    chunk_size) always yields exactly one chunk spanning the whole
+    window — identical behavior to before this fix."""
     if window_start >= window_end:
         return []
     chunks = []
@@ -101,152 +113,276 @@ def _tiktok_orders_compute_chunks(window_start, window_end, chunk_size=TIKTOK_OR
     return chunks
 
 
-def _run_tiktok_orders_catchup(chunks, process_chunk, log, deadline_monotonic, now_monotonic):
-    """Pure control flow (process_chunk/now_monotonic injected — no
-    DB/HTTP/wall-clock coupling in tests). Never starts a chunk once the
-    internal deadline has passed (a chunk already running always
-    finishes or fails outright — never abandoned mid-flight externally).
-    A chunk that raises stops the whole catch-up — later chunks are
-    skipped — but every earlier chunk's work is kept for the caller's
-    single final commit. Raises if zero chunks completed: no artificial
-    sync_state advancement over a call that made no real progress."""
-    if not chunks:
-        raise RuntimeError("TikTok orders: empty window, nothing to catch up")
+def _emit_marker(prefix: str, payload: dict) -> None:
+    print(f"{prefix}{json.dumps(payload, default=str)}", flush=True)
 
-    last_completed_end = None
+
+def _run_tiktok_orders_durable_catchup(chunks, fetch_chunk, write_chunk, advance_watermark, connect,
+                                        log, deadline_monotonic, now_monotonic, emit=_emit_marker) -> dict:
+    """Control flow for the incremental catch-up, with every side effect
+    injected (no DB/HTTP/wall-clock coupling in tests).
+
+    Per chunk: fetch_chunk(s, e) (API only) -> connect() a fresh
+    connection -> write_chunk(cur, fetched, s, e) -> advance_watermark(
+    cur, e) -> conn.commit() -> emit a progress marker. The watermark
+    moves in the SAME transaction as that chunk's rows, so it can never
+    claim coverage the DB doesn't hold, and each commit is independent
+    of every later one.
+
+    Never starts a chunk once the internal deadline has passed. A chunk
+    that raises is rolled back alone and stops the catch-up; earlier
+    committed chunks are untouched. Status:
+      - every requested chunk committed          -> PASS
+      - a chunk failed (any prior progress kept) -> FAIL
+      - soft deadline after >=1 committed chunk  -> PARTIAL_CATCHUP
+      - soft deadline before any chunk           -> FAIL (zero progress)
+    """
+    meta = {
+        "status": None,
+        "requested_window_start": chunks[0][0].isoformat() if chunks else None,
+        "requested_window_end": chunks[-1][1].isoformat() if chunks else None,
+        "last_committed_end": None,
+        "chunks_total": len(chunks),
+        "chunks_attempted": 0,
+        "chunks_completed": 0,
+        "catchup_complete": False,
+        "stopped_by_soft_deadline": False,
+        "error_class": None,
+        "error": None,
+        "totals": {"orders_seen": 0, "orders_inserted": 0, "orders_updated": 0,
+                   "items_inserted": 0, "items_updated": 0},
+    }
+    if not chunks:
+        meta.update(status=ORDERS_STATUS_FAIL, error_class="EMPTY_WINDOW",
+                    error="TikTok orders: empty window, nothing to catch up")
+        return meta
+
     for i, (chunk_start, chunk_end) in enumerate(chunks):
         if now_monotonic() >= deadline_monotonic:
             log(f"internal catch-up time budget reached before chunk {i + 1}/{len(chunks)} "
                 f"({chunk_start.isoformat()}..{chunk_end.isoformat()}) — stopping here, "
-                f"{i} chunk(s) already written this run")
+                f"{meta['chunks_completed']} chunk(s) already committed this run")
+            meta["stopped_by_soft_deadline"] = True
             break
+
+        meta["chunks_attempted"] += 1
+        t0 = time.monotonic()
+        conn = None
         try:
-            process_chunk(chunk_start, chunk_end)
-        except RuntimeError as e:
+            fetched = fetch_chunk(chunk_start, chunk_end)
+            conn = connect()
+            cur = conn.cursor()
+            stats = write_chunk(cur, fetched, chunk_start, chunk_end)
+            advance_watermark(cur, chunk_end)
+            conn.commit()
+        except Exception as e:  # noqa: BLE001
+            if conn is not None:
+                try:
+                    conn.rollback()
+                except Exception:  # noqa: BLE001
+                    pass  # a dead connection has already discarded the transaction
             log(f"chunk {i + 1}/{len(chunks)} ({chunk_start.isoformat()}..{chunk_end.isoformat()}) failed "
-                f"({e}) — stopping catch-up here, keeping {i} earlier chunk(s) already written this run")
+                f"({e}) — rolled back this chunk only, {meta['chunks_completed']} earlier chunk(s) stay committed")
+            meta["error_class"] = type(e).__name__
+            meta["error"] = str(e)
             break
-        last_completed_end = chunk_end
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:  # noqa: BLE001
+                    pass
 
-    if last_completed_end is None:
-        raise RuntimeError(
-            f"TikTok orders: no chunk completed out of {len(chunks)} requested "
-            f"({chunks[0][0].isoformat()}..{chunks[-1][1].isoformat()})"
+        meta["chunks_completed"] += 1
+        meta["last_committed_end"] = chunk_end.isoformat()
+        for k in meta["totals"]:
+            meta["totals"][k] += stats.get(k, 0)
+        emit(TIKTOK_ORDERS_CHUNK_MARKER, {
+            "chunk_start": chunk_start.isoformat(),
+            "chunk_end": chunk_end.isoformat(),
+            "duration_seconds": round(time.monotonic() - t0, 3),
+            "orders_seen": stats.get("orders_seen", 0),
+            "orders_inserted": stats.get("orders_inserted", 0),
+            "orders_updated": stats.get("orders_updated", 0),
+            "items_inserted": stats.get("items_inserted", 0),
+            "items_updated": stats.get("items_updated", 0),
+            "committed": True,
+        })
+
+    if meta["chunks_completed"] == len(chunks):
+        meta["status"] = ORDERS_STATUS_PASS
+        meta["catchup_complete"] = True
+    elif meta["error"] is not None:
+        meta["status"] = ORDERS_STATUS_FAIL
+    elif meta["chunks_completed"] > 0:
+        meta["status"] = ORDERS_STATUS_PARTIAL
+    else:
+        meta.update(status=ORDERS_STATUS_FAIL, error_class="NO_PROGRESS",
+                    error=f"TikTok orders: no chunk completed out of {len(chunks)} requested "
+                          f"({chunks[0][0].isoformat()}..{chunks[-1][1].isoformat()})")
+
+    emit(TIKTOK_ORDERS_CATCHUP_MARKER, {k: v for k, v in meta.items() if k != "error"})
+    return meta
+
+
+def _fetch_orders_window(session, window_start, window_end, log) -> tuple[list[dict], int]:
+    """API only, no DB. Returns (order details, order ids seen)."""
+    rows, status = tt_collect.paginate(
+        _Log(log), session, "orders", _label(), "orders_incr",
+        query_base={"page_size": "50"},
+        body_base={
+            "update_time_ge": int(window_start.timestamp()),
+            "update_time_lt": int(window_end.timestamp()),
+        },
+    )
+    tiktok_check(status, "orders")
+    order_ids = [r["id"] for r in rows if r.get("id")]
+    log(f"orders {window_start.isoformat()}..{window_end.isoformat()}: {len(order_ids)} ids, status={status}")
+
+    details: list[dict] = []
+    for i in range(0, len(order_ids), 50):
+        id_batch = order_ids[i:i + 50]
+
+        def call(id_batch=id_batch):
+            return session.client.read_domain(
+                "order_detail", session.access_token,
+                shop_cipher=session.shop_info.get("shop_cipher"),
+                extra_query={"ids": ",".join(id_batch)},
+            )
+        resp = ic.with_backoff(call, "tiktok order_detail", log)
+        if resp.ok:
+            details.extend(resp.data.get("orders", []))
+        else:
+            raise RuntimeError(f"order_detail failed: code={resp.code} message={resp.message}")
+    return details, len(order_ids)
+
+
+def _write_orders(cur, etl_run_id, shop_id, details, window_end, order_ctr, item_ctr) -> None:
+    """DB only, no API. UPSERTs into the caller's open transaction —
+    never commits itself."""
+    for o in details:
+        oid = o.get("id")
+        payment = o.get("payment") or {}
+        bd = ic.ts_from_epoch(o.get("create_time"))
+        bd = bd.astimezone(ic.VN_TZ).date() if bd else ic.vn_date(window_end)
+        cur.execute(
+            """
+            INSERT INTO core.fact_order (
+                channel, shop_id, order_id, order_status, order_create_time,
+                order_update_time, currency, total_amount, business_date,
+                source_system, source_record_id, source_created_at, source_updated_at,
+                source_endpoint, source_shop_id, etl_run_id
+            ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ON CONFLICT (channel, shop_id, order_id) DO UPDATE SET
+                order_status = EXCLUDED.order_status,
+                order_update_time = EXCLUDED.order_update_time,
+                total_amount = EXCLUDED.total_amount,
+                source_updated_at = EXCLUDED.source_updated_at,
+                etl_run_id = EXCLUDED.etl_run_id
+            RETURNING (xmax = 0) AS inserted;
+            """,
+            (
+                "TIKTOK", shop_id, oid, o.get("status"),
+                ic.ts_from_epoch(o.get("create_time")), ic.ts_from_epoch(o.get("update_time")),
+                payment.get("currency"), payment.get("total_amount"), bd,
+                "TIKTOK", oid, ic.ts_from_epoch(o.get("create_time")), ic.ts_from_epoch(o.get("update_time")),
+                "/order/202309/orders", shop_id, etl_run_id,
+            ),
         )
-    return last_completed_end
+        order_ctr.record(cur.fetchone()[0])
 
-
-def run_orders(cur, etl_run_id, shop_id, window_start, window_end, log) -> dict:
-    session = pilot_common.bootstrap_session()
-    order_ctr, item_ctr = ic.Counters(), ic.Counters()
-    order_ids_total = 0
-
-    def process_chunk(chunk_start, chunk_end):
-        nonlocal order_ids_total
-        rows, status = tt_collect.paginate(
-            _Log(log), session, "orders", _label(), "orders_incr",
-            query_base={"page_size": "50"},
-            body_base={
-                "update_time_ge": int(chunk_start.timestamp()),
-                "update_time_lt": int(chunk_end.timestamp()),
-            },
-        )
-        tiktok_check(status, "orders")
-        order_ids = [r["id"] for r in rows if r.get("id")]
-        order_ids_total += len(order_ids)
-        log(f"orders chunk {chunk_start.isoformat()}..{chunk_end.isoformat()}: {len(order_ids)} ids, status={status}")
-
-        details: list[dict] = []
-        for i in range(0, len(order_ids), 50):
-            id_batch = order_ids[i:i + 50]
-
-            def call(id_batch=id_batch):
-                return session.client.read_domain(
-                    "order_detail", session.access_token,
-                    shop_cipher=session.shop_info.get("shop_cipher"),
-                    extra_query={"ids": ",".join(id_batch)},
-                )
-            resp = ic.with_backoff(call, "tiktok order_detail", log)
-            if resp.ok:
-                details.extend(resp.data.get("orders", []))
-            else:
-                raise RuntimeError(f"order_detail failed: code={resp.code} message={resp.message}")
-
-        for o in details:
-            oid = o.get("id")
-            payment = o.get("payment") or {}
-            bd = ic.ts_from_epoch(o.get("create_time"))
-            bd = bd.astimezone(ic.VN_TZ).date() if bd else ic.vn_date(chunk_end)
+        for li in o.get("line_items", []):
+            qty = 1
+            unit_price = ic.dec(li.get("sale_price"))
+            platform_product_id = str(li["product_id"]) if li.get("product_id") is not None else None
+            platform_sku_id = str(li["sku_id"]) if li.get("sku_id") is not None else None
             cur.execute(
                 """
-                INSERT INTO core.fact_order (
-                    channel, shop_id, order_id, order_status, order_create_time,
-                    order_update_time, currency, total_amount, business_date,
+                INSERT INTO core.fact_order_item (
+                    channel, shop_id, order_id, order_item_id, sku, product_name,
+                    qty, unit_price, item_amount, business_date,
+                    platform_product_id, platform_sku_id,
                     source_system, source_record_id, source_created_at, source_updated_at,
                     source_endpoint, source_shop_id, etl_run_id
-                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                ON CONFLICT (channel, shop_id, order_id) DO UPDATE SET
-                    order_status = EXCLUDED.order_status,
-                    order_update_time = EXCLUDED.order_update_time,
-                    total_amount = EXCLUDED.total_amount,
-                    source_updated_at = EXCLUDED.source_updated_at,
+                ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                ON CONFLICT (channel, shop_id, order_id, order_item_id) DO UPDATE SET
+                    qty = EXCLUDED.qty, unit_price = EXCLUDED.unit_price,
+                    item_amount = EXCLUDED.item_amount, source_updated_at = EXCLUDED.source_updated_at,
+                    sku = EXCLUDED.sku, platform_product_id = EXCLUDED.platform_product_id,
+                    platform_sku_id = EXCLUDED.platform_sku_id,
                     etl_run_id = EXCLUDED.etl_run_id
                 RETURNING (xmax = 0) AS inserted;
                 """,
                 (
-                    "TIKTOK", shop_id, oid, o.get("status"),
-                    ic.ts_from_epoch(o.get("create_time")), ic.ts_from_epoch(o.get("update_time")),
-                    payment.get("currency"), payment.get("total_amount"), bd,
-                    "TIKTOK", oid, ic.ts_from_epoch(o.get("create_time")), ic.ts_from_epoch(o.get("update_time")),
+                    "TIKTOK", shop_id, oid, li.get("id"), li.get("seller_sku") or None, li.get("product_name"),
+                    qty, unit_price, unit_price, bd,
+                    platform_product_id, platform_sku_id,
+                    "TIKTOK", li.get("id"), None, None,
                     "/order/202309/orders", shop_id, etl_run_id,
                 ),
             )
-            order_ctr.record(cur.fetchone()[0])
+            item_ctr.record(cur.fetchone()[0])
 
-            for li in o.get("line_items", []):
-                qty = 1
-                unit_price = ic.dec(li.get("sale_price"))
-                platform_product_id = str(li["product_id"]) if li.get("product_id") is not None else None
-                platform_sku_id = str(li["sku_id"]) if li.get("sku_id") is not None else None
-                cur.execute(
-                    """
-                    INSERT INTO core.fact_order_item (
-                        channel, shop_id, order_id, order_item_id, sku, product_name,
-                        qty, unit_price, item_amount, business_date,
-                        platform_product_id, platform_sku_id,
-                        source_system, source_record_id, source_created_at, source_updated_at,
-                        source_endpoint, source_shop_id, etl_run_id
-                    ) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                    ON CONFLICT (channel, shop_id, order_id, order_item_id) DO UPDATE SET
-                        qty = EXCLUDED.qty, unit_price = EXCLUDED.unit_price,
-                        item_amount = EXCLUDED.item_amount, source_updated_at = EXCLUDED.source_updated_at,
-                        sku = EXCLUDED.sku, platform_product_id = EXCLUDED.platform_product_id,
-                        platform_sku_id = EXCLUDED.platform_sku_id,
-                        etl_run_id = EXCLUDED.etl_run_id
-                    RETURNING (xmax = 0) AS inserted;
-                    """,
-                    (
-                        "TIKTOK", shop_id, oid, li.get("id"), li.get("seller_sku") or None, li.get("product_name"),
-                        qty, unit_price, unit_price, bd,
-                        platform_product_id, platform_sku_id,
-                        "TIKTOK", li.get("id"), None, None,
-                        "/order/202309/orders", shop_id, etl_run_id,
-                    ),
-                )
-                item_ctr.record(cur.fetchone()[0])
+
+def run_orders_window(cur, session, etl_run_id, shop_id, window_start, window_end, log) -> dict:
+    """One bounded window: fetch + write into the caller's transaction.
+    No commit, no sync_state — the caller owns both. Shared by the
+    reconciliation single-day handler (via run_orders) and, split into
+    its fetch/write halves, the incremental durable catch-up."""
+    order_ctr, item_ctr = ic.Counters(), ic.Counters()
+    details, ids_seen = _fetch_orders_window(session, window_start, window_end, log)
+    _write_orders(cur, etl_run_id, shop_id, details, window_end, order_ctr, item_ctr)
+    return {"order_ids_count": ids_seen, "order": order_ctr.as_dict(), "order_item": item_ctr.as_dict()}
+
+
+def run_orders(cur, etl_run_id, shop_id, window_start, window_end, log) -> dict:
+    """Reconciliation path: one single-day window, one pass, written
+    into the caller's transaction, never touches sync_state."""
+    session = pilot_common.bootstrap_session()
+    return run_orders_window(cur, session, etl_run_id, shop_id, window_start, window_end, log)
+
+
+def run_orders_incremental(etl_run_id, shop_id, window_start, window_end, log,
+                            connect=ic.get_db_conn) -> tuple[dict, dict]:
+    """Incremental path: durable per-chunk catch-up. Owns its own
+    connections and commits; the caller must NOT upsert sync_state or
+    commit anything afterwards. Returns (result, catchup_meta)."""
+    session = pilot_common.bootstrap_session()
+
+    def fetch_chunk(chunk_start, chunk_end):
+        return _fetch_orders_window(session, chunk_start, chunk_end, log)
+
+    def write_chunk(cur, fetched, chunk_start, chunk_end):
+        details, ids_seen = fetched
+        chunk_orders, chunk_items = ic.Counters(), ic.Counters()
+        _write_orders(cur, etl_run_id, shop_id, details, chunk_end, chunk_orders, chunk_items)
+        return {
+            "orders_seen": ids_seen,
+            "orders_inserted": chunk_orders.inserted, "orders_updated": chunk_orders.updated,
+            "items_inserted": chunk_items.inserted, "items_updated": chunk_items.updated,
+        }
+
+    def advance_watermark(cur, chunk_end):
+        ic.upsert_sync_state(cur, "TIKTOK", "orders", shop_id, chunk_end, ic.vn_date(chunk_end), "success")
 
     chunks = _tiktok_orders_compute_chunks(window_start, window_end)
     deadline = time.monotonic() + TIKTOK_ORDERS_CHUNK_DEADLINE_SECONDS
-    last_completed_end = _run_tiktok_orders_catchup(chunks, process_chunk, log, deadline, time.monotonic)
+    meta = _run_tiktok_orders_durable_catchup(
+        chunks, fetch_chunk, write_chunk, advance_watermark, connect, log, deadline, time.monotonic,
+    )
+    # Totals cover committed chunks only — a rolled-back chunk's rows
+    # were never counted (see _run_tiktok_orders_durable_catchup).
+    t = meta["totals"]
 
-    result = {"order_ids_count": order_ids_total, "order": order_ctr.as_dict(), "order_item": item_ctr.as_dict()}
-    if last_completed_end < window_end:
-        # P11-HEAL — only set when this call stopped partway through a
-        # multi-chunk catch-up; main() uses this instead of window_end
-        # so sync_state advances only through confirmed successful
-        # coverage, never past it.
-        result["_effective_sync_end"] = last_completed_end
-    return result
+    def _ctr(inserted, updated):
+        return {"received": inserted + updated, "inserted": inserted, "updated": updated, "unchanged": 0}
+
+    result = {
+        "order_ids_count": t["orders_seen"],
+        "order": _ctr(t["orders_inserted"], t["orders_updated"]),
+        "order_item": _ctr(t["items_inserted"], t["items_updated"]),
+    }
+    return result, meta
 
 
 def run_returns(cur, etl_run_id, shop_id, window_start, window_end, log) -> dict:
@@ -1063,6 +1199,24 @@ def main() -> int:
         return 1
 
     log = ic.simple_log(f"TIKTOK/{domain}")
+
+    if mode != "reconcile" and domain == "orders":
+        # P11-LAST-MILE — durable per-chunk catch-up: every chunk commits
+        # its own rows + sync_state on its own connection, so nothing is
+        # left for this function to commit (and nothing earlier can be
+        # rolled back by a later failure or an external kill).
+        try:
+            result, meta = run_orders_incremental(etl_run_id, shop_id, window_start, window_end, log)
+        except Exception as e:  # noqa: BLE001 — e.g. bootstrap_session() failed before any chunk
+            print(json.dumps({"status": "FAIL", "error": str(e)}, default=str))
+            return 1
+        catchup = {k: v for k, v in meta.items() if k not in ("status", "error", "totals")}
+        out = {"status": meta["status"], "result": result, "catchup": catchup}
+        if meta["status"] == ORDERS_STATUS_FAIL:
+            out["error"] = meta["error"]
+        print(json.dumps(out, default=str))
+        return 1 if meta["status"] == ORDERS_STATUS_FAIL else 0
+
     conn = ic.get_db_conn()
     cur = conn.cursor()
     try:
@@ -1077,12 +1231,7 @@ def main() -> int:
             return 0
 
         result = HANDLERS[domain](cur, etl_run_id, shop_id, window_start, window_end, log)
-        # P11-HEAL — a handler (currently only run_orders) may report it
-        # only got partway through a multi-chunk catch-up via
-        # "_effective_sync_end"; every other domain never sets this key,
-        # so .pop(...) falls back to window_end exactly as before.
-        sync_end = result.pop("_effective_sync_end", None) or window_end
-        ic.upsert_sync_state(cur, "TIKTOK", domain, shop_id, sync_end, ic.vn_date(sync_end), "success")
+        ic.upsert_sync_state(cur, "TIKTOK", domain, shop_id, window_end, ic.vn_date(window_end), "success")
         conn.commit()
         conn.close()
         print(json.dumps({"status": "PASS", "result": result}, default=str))

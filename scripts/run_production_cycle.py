@@ -66,10 +66,16 @@ GOLD_SCRIPT_TIMEOUT_SECONDS = 600  # one Gold/PNL script, DB-only, no external A
 # finance D-3 work when the stage timeout cut it off — a cumulative
 # stage-budget shortfall, not a containment failure (the in-flight domain
 # was still cleanly finalized as ORCHESTRATOR_TIMEOUT). Each per-domain
-# reconciliation call stays independently bounded at 900s
-# (pipelines/reconcile.py); this only gives the stage as a whole enough
+# reconciliation call stays independently bounded (900s default, 1200s
+# for TIKTOK/finance — pipelines/reconcile.py); this only gives the stage as a whole enough
 # cumulative room to actually finish a D-1/D-3/D-7 pass.
-RECONCILIATION_TIMEOUT_SECONDS = 3600  # D-1/D-3/D-7 re-check across all domains
+# P11-LAST-MILE — live timing (run 35832785885): D1 ~1943s + D3 ~1429s
+# = ~3372s, leaving only ~228s of the old 3600s for D7, which got
+# through 5 Shopee domains before the stage was killed (27 of at most 33
+# domain executions). 6000s is evidence-based headroom for the full
+# D1/D3/D7 pass while staying bounded. Workflow timeout-minutes moved
+# 200 -> 240 alongside it (scripts/test_run_production_cycle_timeouts.py).
+RECONCILIATION_TIMEOUT_SECONDS = 6000  # D-1/D-3/D-7 re-check across all domains
 HEALTHCHECK_TIMEOUT_SECONDS = 120  # unchanged — already its own explicit bound
 
 
@@ -288,7 +294,8 @@ def compute_cycle_verdict(ingestion: dict, gold_steps: list, recon: dict, health
         reasons.append(f"INGESTION_PROCESS_{ingestion['status']}")
     elif ingestion.get("ingestion_process_status") == "INGESTION_RESULT_UNPARSEABLE":
         reasons.append("INGESTION_RESULT_UNPARSEABLE")
-    elif ingestion["status"] == "FAILED" and not ingestion.get("ingestion_failed_domains"):
+    elif (ingestion["status"] == "FAILED" and not ingestion.get("ingestion_failed_domains")
+          and not ingestion.get("ingestion_partial_catchup_domains")):
         # Process exited non-zero (or returned an internally
         # inconsistent marker) with no per-domain explanation — still a
         # real process-level failure; fail closed rather than assume
@@ -297,6 +304,10 @@ def compute_cycle_verdict(ingestion: dict, gold_steps: list, recon: dict, health
 
     for domain in ingestion.get("ingestion_failed_domains", []):
         reasons.append(f"INGESTION_DOMAIN_FAILURE:{domain}")
+    # P11-LAST-MILE — durable progress, backlog remains: not data loss,
+    # but a required source is not caught up, so never GREEN/YELLOW.
+    for domain in ingestion.get("ingestion_partial_catchup_domains", []):
+        reasons.append(f"INGESTION_DOMAIN_PARTIAL_CATCHUP:{domain}")
 
     for step in gold_steps:
         if step["status"] != "SUCCESS":
@@ -304,6 +315,12 @@ def compute_cycle_verdict(ingestion: dict, gold_steps: list, recon: dict, health
 
     if recon["status"] != "SUCCESS":
         reasons.append(f"RECONCILIATION_{recon['status']}")
+    # P11-LAST-MILE — per-domain reconciliation failures are promoted by
+    # name (e.g. RECONCILIATION_DOMAIN_FAILURE:TIKTOK/finance:D1), from
+    # the final summary when reconcile.py completed, else from the
+    # partial per-domain timing markers flushed before a stage kill.
+    for domain in recon.get("reconciliation_failed_domains", []):
+        reasons.append(f"RECONCILIATION_DOMAIN_FAILURE:{domain}")
 
     if healthcheck_overall == "RED":
         reasons.append("HEALTHCHECK_RED")
@@ -396,8 +413,9 @@ def run_ingestion() -> dict:
 
     domains = marker.get("domains", {}) or {}
     failed_domains = marker.get("failed_domains", []) or []
-    marker_status = marker.get("process_status", "FAIL" if failed_domains else "PASS")
-    ok = (r.returncode == 0) and marker_status == "PASS" and not failed_domains
+    partial_domains = marker.get("partial_catchup_domains", []) or []
+    marker_status = marker.get("process_status", "FAIL" if (failed_domains or partial_domains) else "PASS")
+    ok = (r.returncode == 0) and marker_status == "PASS" and not failed_domains and not partial_domains
     base.update({
         "status": "SUCCESS" if ok else "FAILED",
         "ingestion_process_status": marker_status if r.returncode == 0 else "PROCESS_EXIT_NONZERO",
@@ -409,6 +427,7 @@ def run_ingestion() -> dict:
             for domain, result in domains.items()
         },
         "ingestion_failed_domains": failed_domains,
+        "ingestion_partial_catchup_domains": partial_domains,
         "per_domain": domains,
     })
     return base
@@ -421,6 +440,32 @@ def run_gold_chain() -> list[dict]:
             label, [PY, str(GOLD_DIR / script)], GOLD_DIR, GOLD_SCRIPT_TIMEOUT_SECONDS,
         ))
     return steps
+
+
+def compute_recon_stage_status(timed_out: bool, returncode, parsed: dict) -> tuple[str, list]:
+    """P11-LAST-MILE — pure; fail closed. Returns (status, failed
+    domains as "SOURCE/domain:WINDOW").
+
+      - stage killed by RECONCILIATION_TIMEOUT_SECONDS -> TIMEOUT, with
+        failed domains taken from the partial timing markers
+      - completed but no parseable final summary (or one missing
+        failed_domain_count) -> RESULT_UNPARSEABLE
+      - non-zero exit or failed_domain_count > 0 -> FAILED
+      - otherwise SUCCESS
+    """
+    summary = parsed.get("final_summary")
+    if timed_out or not isinstance(summary, dict):
+        failed = [
+            f"{t.get('source_system')}/{t.get('domain')}:{t.get('window')}"
+            for t in parsed.get("domain_timings", []) if t.get("status") != "PASS"
+        ]
+        return ("TIMEOUT" if timed_out else "RESULT_UNPARSEABLE"), failed
+    if "failed_domain_count" not in summary:
+        return "RESULT_UNPARSEABLE", []
+    failed = list(summary.get("failed_domains") or [])
+    if returncode != 0 or summary["failed_domain_count"] > 0 or failed:
+        return "FAILED", failed
+    return "SUCCESS", []
 
 
 def run_reconciliation() -> dict:
@@ -446,6 +491,7 @@ def run_reconciliation() -> dict:
             "reconciliation_elapsed_seconds": None, "reconciliation_completed_domains": 0,
             "reconciliation_domain_timings": [], "reconciliation_completed_windows": [],
             "reconciliation_last_window": None, "reconciliation_slowest_completed_domains": [],
+            "reconciliation_failed_domains": [], "reconciliation_failed_domain_count": 0,
         }
 
     finished_at = now_iso()
@@ -454,10 +500,12 @@ def run_reconciliation() -> dict:
     domain_timings = parsed["domain_timings"]
     slowest = sorted(domain_timings, key=lambda t: t.get("duration_seconds", 0), reverse=True)[:5]
 
-    status = "TIMEOUT" if timed_out else ("SUCCESS" if r.returncode == 0 else "FAILED")
+    status, failed_domains = compute_recon_stage_status(timed_out, r.returncode, parsed)
     return {
         "label": label, "started_at": started_at, "finished_at": finished_at,
         "status": status, "returncode": r.returncode,
+        "reconciliation_failed_domains": failed_domains,
+        "reconciliation_failed_domain_count": len(failed_domains),
         "stdout_tail": full_stdout[-4000:], "stderr_tail": (r.stderr or "")[-2000:] if r.returncode != 0 else None,
         "reconciliation_elapsed_seconds": (
             datetime.fromisoformat(finished_at) - datetime.fromisoformat(started_at)
@@ -518,6 +566,8 @@ def main():
     print(f"ingestion status: {ingestion['status']} (process: {ingestion.get('ingestion_process_status')})")
     if ingestion.get("ingestion_failed_domains"):
         print(f"  failed domain(s): {', '.join(ingestion['ingestion_failed_domains'])}")
+    if ingestion.get("ingestion_partial_catchup_domains"):
+        print(f"  partial catch-up domain(s): {', '.join(ingestion['ingestion_partial_catchup_domains'])}")
     if ingestion["status"] == "TIMEOUT":
         # P11-TER.5 — we just terminated incremental.py's whole process
         # group (see run_contained_subprocess), so any row it started
@@ -544,6 +594,7 @@ def main():
     log["reconciliation_completed_windows"] = recon.get("reconciliation_completed_windows", [])
     log["reconciliation_last_window"] = recon.get("reconciliation_last_window")
     log["reconciliation_slowest_completed_domains"] = recon.get("reconciliation_slowest_completed_domains", [])
+    log["reconciliation_failed_domains"] = recon.get("reconciliation_failed_domains", [])
     print(f"reconciliation status: {recon['status']} "
           f"(completed {recon.get('reconciliation_completed_domains')} domain(s), "
           f"last window touched: {recon.get('reconciliation_last_window')})")
@@ -596,6 +647,7 @@ def main():
     log["ingestion_process_status"] = ingestion.get("ingestion_process_status")
     log["ingestion_domain_results"] = ingestion.get("ingestion_domain_results", {})
     log["ingestion_failed_domains"] = ingestion.get("ingestion_failed_domains", [])
+    log["ingestion_partial_catchup_domains"] = ingestion.get("ingestion_partial_catchup_domains", [])
     log["ingestion_required_failure_count"] = len(ingestion.get("ingestion_failed_domains", []))
 
     log_path = LOG_DIR / f"cycle_{cycle_started_at.replace(':', '-')}.json"

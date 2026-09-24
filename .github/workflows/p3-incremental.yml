@@ -116,7 +116,14 @@ jobs:
     # ingestion 3600s + 7 Gold scripts x 600s (4200s) + reconciliation
     # 3600s + healthcheck 120s = 11520s, +300s minimum margin = 11820s.
     # 200 min = 12000s clears that with room to spare.
-    timeout-minutes: 200
+    #
+    # P11-LAST-MILE (2026-09-24): RECONCILIATION_TIMEOUT_SECONDS raised
+    # 3600 -> 6000 (live timing, run 35832785885: D1+D3 alone used ~3372s,
+    # D7 was cut off after 5 of 11 domains). New worst-case envelope:
+    # ingestion 3600s + 7 Gold x 600s (4200s) + reconciliation 6000s +
+    # healthcheck 120s = 13920s, +300s minimum margin = 14220s (237 min).
+    # 240 min = 14400s clears that.
+    timeout-minutes: 240
     env:
       TZ: UTC
     steps:

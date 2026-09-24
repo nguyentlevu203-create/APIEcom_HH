@@ -84,15 +84,16 @@ def test_job_timeout_exceeds_summed_stage_budget():
 
 
 def test_p11_quinque_expected_stage_values():
-    """P11-QUINQUE Q8 — pins the exact values this checkpoint set, so a
+    """P11-QUINQUE Q8 / P11-LAST-MILE — pins the exact values (reconciliation
+    3600 -> 6000 and job timeout 200 -> 240 in P11-LAST-MILE), so a
     future edit that silently changes one of them (without also updating
     the reasoning in the workflow comment) fails loudly here first."""
     assert _int_constant(CYCLE_SRC, "INGESTION_TIMEOUT_SECONDS") == 3600
     assert _int_constant(CYCLE_SRC, "GOLD_SCRIPT_TIMEOUT_SECONDS") == 600
-    assert _int_constant(CYCLE_SRC, "RECONCILIATION_TIMEOUT_SECONDS") == 3600
+    assert _int_constant(CYCLE_SRC, "RECONCILIATION_TIMEOUT_SECONDS") == 6000
     assert _int_constant(CYCLE_SRC, "HEALTHCHECK_TIMEOUT_SECONDS") == 120
     assert _gold_chain_length(CYCLE_SRC) == 7
-    assert _job_timeout_minutes(WORKFLOW_SRC) == 200
+    assert _job_timeout_minutes(WORKFLOW_SRC) == 240
 
 
 def test_domain_worker_timeout_selection():

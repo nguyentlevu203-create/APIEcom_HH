@@ -53,6 +53,22 @@ WORKER_BY_SYSTEM = {"SHOPEE": SHOPEE_WORKER, "TIKTOK": TIKTOK_WORKER}
 SHOPEE_RECON_DOMAINS = ["orders", "finance", "returns", "ads", "affiliate_ams"]
 TIKTOK_RECON_DOMAINS = ["orders", "finance", "returns", "affiliate", "product_analytics", "live"]
 
+# P11-LAST-MILE — per-domain worker timeout, keyed by (source_system,
+# domain). Every domain keeps the 900s default except TIKTOK/finance,
+# proven live (run 35832785885) to need more: D1 took ~903s (hit the
+# 900s cap), D3 ~723s. 1200s gives ~33% headroom over the worst measured
+# run without raising any other domain's limit. Containment (SIGTERM ->
+# grace -> SIGKILL, finish_run_log, continue to later domains) applies
+# unchanged to every domain.
+DEFAULT_RECON_DOMAIN_TIMEOUT_SECONDS = 900
+RECON_DOMAIN_TIMEOUT_SECONDS = {
+    ("TIKTOK", "finance"): 1200,
+}
+
+
+def recon_domain_timeout(source_system: str, domain: str) -> int:
+    return RECON_DOMAIN_TIMEOUT_SECONDS.get((source_system, domain), DEFAULT_RECON_DOMAIN_TIMEOUT_SECONDS)
+
 
 def today_hh() -> "datetime.date":
     """Section 6: TODAY_HH computed at runtime from Asia/Ho_Chi_Minh —
@@ -139,7 +155,7 @@ def run_reconcile_domain(window_label: str, source_system: str, domain: str, sho
     conn.close()
 
     worker = WORKER_BY_SYSTEM[source_system]
-    recon_timeout = 900
+    recon_timeout = recon_domain_timeout(source_system, domain)
     proc, timed_out = ic.run_contained_subprocess(
         [sys.executable, str(worker), domain, window_start.isoformat(), window_end.isoformat(),
          etl_run_id, "reconcile", business_date.isoformat()],
@@ -234,6 +250,7 @@ def main() -> int:
     overall_t0 = time.monotonic()
     all_domain_timings: list[dict] = []
     window_timings: list[dict] = []
+    failed_domains: list[str] = []
 
     for window_label, business_date in dates.items():
         results[window_label] = {}
@@ -248,6 +265,7 @@ def main() -> int:
             if not shop_id:
                 results[window_label][source_system] = {"status": "FAIL", "error": f"no shop_id for {source_system}"}
                 failed_count += 1
+                failed_domains.append(f"{source_system}/*:{window_label}")
                 continue
             for domain in domains:
                 if only and (source_system, domain) not in only:
@@ -261,6 +279,7 @@ def main() -> int:
                     completed_count += 1
                 else:
                     failed_count += 1
+                    failed_domains.append(f"{key}:{window_label}")
 
         window_end_payload = {
             "window": window_label, "business_date": business_date.isoformat(),
@@ -286,9 +305,19 @@ def main() -> int:
         "window_timings": window_timings,
         "domain_timings": all_domain_timings,
         "slowest_domains": slowest,
+        "completed_domain_count": total_success,
+        "failed_domain_count": len(failed_domains),
+        "failed_domains": failed_domains,
     }
     print(f"{RECON_RESULT_MARKER}{json.dumps(summary, default=str)}", flush=True)
-    return 0
+    # P11-LAST-MILE — fail closed. Domain isolation above is untouched
+    # (every domain still ran regardless of an earlier one's outcome);
+    # this only makes the PROCESS report failure once they all have.
+    return compute_recon_exit_code(failed_domains)
+
+
+def compute_recon_exit_code(failed_domains: list[str]) -> int:
+    return 1 if failed_domains else 0
 
 
 if __name__ == "__main__":

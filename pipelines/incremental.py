@@ -157,6 +157,9 @@ def run_domain(source_system: str, domain: str, shop_id: str, force: bool) -> di
         return {
             "status": "FAIL", "window_start": window_start.isoformat(), "window_note": window_note,
             "cadence_minutes": cadence, "etl_run_id": etl_run_id, "error": error,
+            # P11-LAST-MILE — chunks the worker durably committed before
+            # it was killed (flushed marker lines survive the kill).
+            **_committed_chunk_progress(proc.stdout or ""),
         }
 
     worker_result = None
@@ -175,12 +178,52 @@ def run_domain(source_system: str, domain: str, shop_id: str, force: bool) -> di
             "cadence_minutes": cadence, "etl_run_id": etl_run_id, "result": worker_result.get("result"),
         }
 
+    if proc.returncode == 0 and worker_result and worker_result.get("status") == ic.PARTIAL_CATCHUP_STATUS:
+        # P11-LAST-MILE — durable progress was committed (sync_state
+        # already advanced to catchup.last_committed_end by the worker
+        # itself) but backlog remains. The run-log row records what this
+        # run genuinely did ('success', established vocabulary); the
+        # domain status stays PARTIAL_CATCHUP so the cycle verdict never
+        # reads it as fully caught up.
+        catchup = worker_result.get("catchup") or {}
+        rows_processed = _sum_received(worker_result.get("result", {}))
+        note = (f"{ic.PARTIAL_CATCHUP_STATUS}: committed {catchup.get('chunks_completed')}/"
+                f"{catchup.get('chunks_total')} chunk(s) through {catchup.get('last_committed_end')}, backlog remains")
+        ic.finish_run_log(source_system, domain, etl_run_id, "success", rows_processed, note)
+        return {
+            "status": ic.PARTIAL_CATCHUP_STATUS, "window_start": window_start.isoformat(), "window_note": window_note,
+            "cadence_minutes": cadence, "etl_run_id": etl_run_id, "result": worker_result.get("result"),
+            "catchup": catchup,
+        }
+
     error = (worker_result or {}).get("error") or proc.stderr[-2000:] or f"worker exit code {proc.returncode}"
     ic.finish_run_log(source_system, domain, etl_run_id, "fail", 0, error)
-    return {
+    failed = {
         "status": "FAIL", "window_start": window_start.isoformat(), "window_note": window_note,
         "cadence_minutes": cadence, "etl_run_id": etl_run_id, "error": error,
     }
+    if worker_result and worker_result.get("catchup"):
+        failed["catchup"] = worker_result["catchup"]
+    return failed
+
+
+TIKTOK_ORDERS_CHUNK_MARKER = "HH_TIKTOK_ORDERS_CHUNK_JSON="
+
+
+def _committed_chunk_progress(stdout: str) -> dict:
+    """Counts HH_TIKTOK_ORDERS_CHUNK_JSON= markers (one per durably
+    committed chunk) in a worker's stdout. Empty dict when there are
+    none, so other domains' results are unchanged."""
+    committed = []
+    for line in stdout.splitlines():
+        if line.startswith(TIKTOK_ORDERS_CHUNK_MARKER):
+            try:
+                committed.append(json.loads(line[len(TIKTOK_ORDERS_CHUNK_MARKER):]))
+            except (json.JSONDecodeError, ValueError):
+                continue
+    if not committed:
+        return {}
+    return {"committed_chunks": len(committed), "last_committed_end": committed[-1].get("chunk_end")}
 
 
 def _sum_received(result: dict) -> int:

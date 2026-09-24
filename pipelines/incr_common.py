@@ -259,6 +259,15 @@ def simple_log(prefix: str):
 # failure: fail-closed, an allowlist rather than a denylist.
 REQUIRED_OK_STATUSES = {"PASS", "NOT_DUE", "NO_PERMISSION / SEPARATE_ADS_API"}
 
+# P11-LAST-MILE — a required domain that made durable, committed
+# progress but stopped at its internal soft deadline with backlog still
+# remaining (currently only TIKTOK/orders' per-chunk catch-up). Not data
+# loss and not a hard failure — but also NOT "fully caught up", so it is
+# deliberately NOT in REQUIRED_OK_STATUSES: the cycle must never report
+# it as a healthy required-domain sync. Reported separately from real
+# failures so the cycle reason says which one it was.
+PARTIAL_CATCHUP_STATUS = "PARTIAL_CATCHUP"
+
 
 def is_domain_ok(status: Optional[str]) -> bool:
     return status in REQUIRED_OK_STATUSES
@@ -271,6 +280,8 @@ def classify_domain_error(domain_result: dict) -> Optional[str]:
     carries. Returns None for a domain that isn't a failure at all."""
     if is_domain_ok(domain_result.get("status")):
         return None
+    if domain_result.get("status") == PARTIAL_CATCHUP_STATUS:
+        return PARTIAL_CATCHUP_STATUS
     error = str(domain_result.get("error") or "")
     if "DOMAIN_WORKER_TIMEOUT" in error:
         return "DOMAIN_WORKER_TIMEOUT"
@@ -288,11 +299,16 @@ def compute_ingestion_verdict(results: dict) -> dict:
     success or failure."""
     failed_domains = sorted(
         domain for domain, result in results.items()
-        if not is_domain_ok(result.get("status"))
+        if not is_domain_ok(result.get("status")) and result.get("status") != PARTIAL_CATCHUP_STATUS
+    )
+    partial_catchup_domains = sorted(
+        domain for domain, result in results.items()
+        if result.get("status") == PARTIAL_CATCHUP_STATUS
     )
     return {
-        "process_status": "FAIL" if failed_domains else "PASS",
+        "process_status": "FAIL" if (failed_domains or partial_catchup_domains) else "PASS",
         "failed_domains": failed_domains,
+        "partial_catchup_domains": partial_catchup_domains,
     }
 
 
