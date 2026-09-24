@@ -438,3 +438,53 @@ def test_internal_deadline_has_real_margin_below_external_worker_timeout():
         f"only {margin}s of margin between the internal deadline and the external kill — "
         f"too tight to reliably finish an in-flight chunk"
     )
+
+
+# =====================================================================
+# P11-FIX-4 — tiktok_client.NetworkError (e.g. ReadTimeout) is retried
+# by the existing bounded backoff instead of failing on the first try
+# (run 35948968552: TIKTOK/finance D3 died on one ReadTimeout).
+# =====================================================================
+
+def test_network_error_is_retried_then_succeeds(monkeypatch):
+    monkeypatch.setattr(incr_worker.ic.time, "sleep", lambda s: None)
+    attempts = []
+
+    def call():
+        attempts.append(1)
+        if len(attempts) < 3:
+            raise incr_worker.NetworkError("GET /finance/x/statement_transactions: network/timeout error: ReadTimeout")
+        return "ok"
+
+    assert incr_worker._with_backoff(call, "tiktok finance x", _fake_log) == "ok"
+    assert len(attempts) == 3
+
+
+def test_network_error_still_raises_after_bounded_retries(monkeypatch):
+    monkeypatch.setattr(incr_worker.ic.time, "sleep", lambda s: None)
+    attempts = []
+
+    def call():
+        attempts.append(1)
+        raise incr_worker.NetworkError("GET /x: network/timeout error: ReadTimeout")
+
+    with pytest.raises(RuntimeError, match="ReadTimeout"):
+        incr_worker._with_backoff(call, "tiktok finance x", _fake_log)
+    assert len(attempts) == 1 + len(incr_worker.ic.BACKOFF_DELAYS)
+
+
+def test_non_network_errors_are_not_retried(monkeypatch):
+    monkeypatch.setattr(incr_worker.ic.time, "sleep", lambda s: None)
+    attempts = []
+
+    def call():
+        attempts.append(1)
+        raise ValueError("bad payload")
+
+    with pytest.raises(ValueError):
+        incr_worker._with_backoff(call, "x", _fake_log)
+    assert len(attempts) == 1
+
+
+def test_all_tiktok_worker_api_calls_use_the_network_aware_backoff():
+    assert "ic.with_backoff(call" not in WORKER_SRC

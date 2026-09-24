@@ -127,3 +127,45 @@ def test_c_tiktok_finance_timeout_contained_then_later_domains_run(monkeypatch, 
     assert summary["failed_domain_count"] == 3
     timed_out_logs = [f for f in finished if f[:2] == ("TIKTOK", "finance")]
     assert all(status == "fail" and "1200s" in err for _, _, status, err in timed_out_logs)
+
+
+# P11-FIX-4 — AMS D-1 not published yet is not a reconciliation failure
+def test_source_not_ready_domain_is_not_a_failure(monkeypatch, capsys):
+    rc, calls = _run_main(
+        monkeypatch,
+        lambda w, s, d: "SOURCE_NOT_READY" if (w, s, d) == ("D1", "SHOPEE", "affiliate_ams") else "PASS",
+    )
+    summary = _final_summary(capsys.readouterr().out)
+    assert rc == 0
+    assert len(calls) == 33
+    assert summary["failed_domain_count"] == 0
+    assert summary["not_ready_domains"] == ["SHOPEE/affiliate_ams:D1"]
+    assert summary["completed_domain_count"] == 33
+
+
+def test_run_reconcile_domain_maps_worker_source_not_ready(monkeypatch, capsys):
+    from datetime import date
+    finished = []
+
+    class _Conn:
+        def cursor(self):
+            return self
+
+        def commit(self):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(reconcile.ic, "get_db_conn", lambda: _Conn())
+    monkeypatch.setattr(reconcile.ic, "start_run_log", lambda *a, **k: "run-id")
+    monkeypatch.setattr(reconcile.ic, "finish_run_log",
+                        lambda ss, d, rid, status, rows=0, err="": finished.append((status, err)))
+    monkeypatch.setattr(reconcile.ic, "run_contained_subprocess", lambda args, cwd, timeout: (
+        subprocess.CompletedProcess(args, 0, json.dumps({"status": "SOURCE_NOT_READY", "note": "not published"}) + "\n", ""),
+        False))
+    res = reconcile.run_reconcile_domain("D1", "SHOPEE", "affiliate_ams", "s1", date(2026, 9, 23))
+    assert res["status"] == "SOURCE_NOT_READY"
+    assert finished == [("success", "SOURCE_NOT_READY: not published")]
+    timing = [l for l in capsys.readouterr().out.splitlines() if l.startswith(reconcile.RECON_DOMAIN_TIMING_MARKER)]
+    assert json.loads(timing[0][len(reconcile.RECON_DOMAIN_TIMING_MARKER):])["error_class"] is None

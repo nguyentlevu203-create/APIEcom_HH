@@ -207,6 +207,21 @@ def run_reconcile_domain(window_label: str, source_system: str, domain: str, sho
                              time.monotonic() - t0, timed_out=False, sink=timings_sink)
         return result
 
+    if proc.returncode == 0 and worker_result and worker_result.get("status") == ic.SOURCE_NOT_READY_STATUS:
+        # P11-FIX-4 — e.g. Shopee AMS has not published D-1 yet at an
+        # early-morning run. Nothing written; not a reconciliation
+        # failure. Prolonged lag is caught by source coverage instead.
+        note = f"{ic.SOURCE_NOT_READY_STATUS}: {worker_result.get('note') or 'source has not published this date yet'}"
+        ic.finish_run_log(source_system, domain, etl_run_id, "success", 0, note)
+        result = {
+            "status": ic.SOURCE_NOT_READY_STATUS, "business_date": business_date.isoformat(),
+            "window_start": window_start.isoformat(), "window_end": window_end.isoformat(),
+            "etl_run_id": etl_run_id, "note": worker_result.get("note"),
+        }
+        _emit_domain_timing(window_label, business_date, source_system, domain, result,
+                             time.monotonic() - t0, timed_out=False, sink=timings_sink)
+        return result
+
     error = (worker_result or {}).get("error") or proc.stderr[-2000:] or f"worker exit code {proc.returncode}"
     ic.finish_run_log(source_system, domain, etl_run_id, "fail", 0, error)
     result = {
@@ -251,6 +266,7 @@ def main() -> int:
     all_domain_timings: list[dict] = []
     window_timings: list[dict] = []
     failed_domains: list[str] = []
+    not_ready_domains: list[str] = []
 
     for window_label, business_date in dates.items():
         results[window_label] = {}
@@ -275,8 +291,10 @@ def main() -> int:
                     window_label, source_system, domain, shop_id, business_date, timings_sink=all_domain_timings,
                 )
                 results[window_label][key] = domain_result
-                if domain_result.get("status") == "PASS":
+                if ic.is_domain_ok(domain_result.get("status")):
                     completed_count += 1
+                    if domain_result.get("status") == ic.SOURCE_NOT_READY_STATUS:
+                        not_ready_domains.append(f"{key}:{window_label}")
                 else:
                     failed_count += 1
                     failed_domains.append(f"{key}:{window_label}")
@@ -295,7 +313,7 @@ def main() -> int:
     # full worker stdout. domain_timings here are the exact same
     # payloads _emit_domain_timing() already flushed per domain via
     # timings_sink, not recomputed differently.
-    total_success = sum(1 for t in all_domain_timings if t["status"] == "PASS")
+    total_success = sum(1 for t in all_domain_timings if ic.is_domain_ok(t["status"]))
     slowest = sorted(all_domain_timings, key=lambda t: t["duration_seconds"], reverse=True)[:5]
     summary = {
         "total_elapsed_seconds": round(time.monotonic() - overall_t0, 3),
@@ -308,6 +326,7 @@ def main() -> int:
         "completed_domain_count": total_success,
         "failed_domain_count": len(failed_domains),
         "failed_domains": failed_domains,
+        "not_ready_domains": not_ready_domains,
     }
     print(f"{RECON_RESULT_MARKER}{json.dumps(summary, default=str)}", flush=True)
     # P11-LAST-MILE — fail closed. Domain isolation above is untouched

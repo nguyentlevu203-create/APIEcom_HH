@@ -28,6 +28,7 @@ sys.path.insert(0, str(PILOT_DIR))  # pilot_common.py inserts INTEGRATION_DIR it
 import pilot_common  # noqa: E402
 import collect as tt_collect  # noqa: E402
 import incr_common as ic  # noqa: E402
+from tiktok_client import NetworkError  # noqa: E402  (pilot_common put INTEGRATION_DIR on sys.path)
 from canonical_normalizer import (  # noqa: E402
     normalize_tiktok_finance_sku, aggregate_tiktok_finance_skus,
     assign_occurrence_indices, audit_unknown_nonzero_components,
@@ -51,6 +52,23 @@ class _Log:
 
     def log(self, msg: str) -> None:
         self._log(msg)
+
+
+def _with_backoff(call, label, log):
+    """ic.with_backoff() only retries requests' Timeout/ConnectionError
+    and TransientHTTPError — but tiktok_client wraps every requests
+    exception as its own NetworkError (a plain RuntimeError), so a single
+    ReadTimeout used to fail the whole domain on the first try. Proven
+    live (run 35948968552): TIKTOK/finance D3 reconciliation died on one
+    statement_transactions ReadTimeout. Re-raised as TransientHTTPError
+    so the existing bounded 5s/15s/45s retry applies; still raises after
+    the last retry."""
+    def wrapped():
+        try:
+            return call()
+        except NetworkError as e:
+            raise ic.TransientHTTPError(str(e)) from None
+    return ic.with_backoff(wrapped, label, log)
 
 
 def _label() -> str:
@@ -249,7 +267,7 @@ def _fetch_orders_window(session, window_start, window_end, log) -> tuple[list[d
                 shop_cipher=session.shop_info.get("shop_cipher"),
                 extra_query={"ids": ",".join(id_batch)},
             )
-        resp = ic.with_backoff(call, "tiktok order_detail", log)
+        resp = _with_backoff(call, "tiktok order_detail", log)
         if resp.ok:
             details.extend(resp.data.get("orders", []))
         else:
@@ -459,7 +477,7 @@ def run_finance(cur, etl_run_id, shop_id, window_start, window_end, log) -> dict
                 "finance_order_statement_transactions", session.access_token,
                 shop_cipher=session.shop_info.get("shop_cipher"), path_params={"order_id": oid},
             )
-        resp = ic.with_backoff(call, f"tiktok finance {oid}", log)
+        resp = _with_backoff(call, f"tiktok finance {oid}", log)
         has_real = resp.ok and bool(resp.data.get("sku_transactions"))
 
         # Phase 6C P4-bis — TRANSIENT_SETTLEMENT_REGRESSION guard. Proven
@@ -481,7 +499,7 @@ def run_finance(cur, etl_run_id, shop_id, window_start, window_end, log) -> dict
             existing_row = cur.fetchone()
             existing = {"settlement_type": existing_row[0], "settlement_amount": existing_row[1]} if existing_row else None
             if decide_settlement_write(existing, "UNKNOWN" if not resp.ok else "NOT_SETTLED_YET") == "RETRY":
-                resp = ic.with_backoff(call, f"tiktok finance RETRY {oid}", log)
+                resp = _with_backoff(call, f"tiktok finance RETRY {oid}", log)
                 has_real = resp.ok and bool(resp.data.get("sku_transactions"))
                 if not has_real:
                     retry_status = "UNKNOWN" if not resp.ok else "NOT_SETTLED_YET"

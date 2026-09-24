@@ -257,7 +257,15 @@ def simple_log(prefix: str):
 # no current code path emits it. Anything not in this set — including a
 # status this code has never produced before — is treated as a domain
 # failure: fail-closed, an allowlist rather than a denylist.
-REQUIRED_OK_STATUSES = {"PASS", "NOT_DUE", "NO_PERMISSION / SEPARATE_ADS_API"}
+REQUIRED_OK_STATUSES = {"PASS", "NOT_DUE", "NO_PERMISSION / SEPARATE_ADS_API", "SOURCE_NOT_READY"}
+
+# P11-FIX-4 — the source itself reports that nothing in the requested
+# range is published yet (currently only Shopee AMS, whose reports lag
+# ~1 day). Nothing written, watermark unchanged, retried next cycle.
+# OK for the cycle verdict: prolonged lag is caught by
+# mart.v_ai_source_coverage (SOURCE_LAGGING, then STALE -> RED for a
+# required source), not by failing every early-morning cycle.
+SOURCE_NOT_READY_STATUS = "SOURCE_NOT_READY"
 
 # P11-LAST-MILE — a required domain that made durable, committed
 # progress but stopped at its internal soft deadline with backlog still

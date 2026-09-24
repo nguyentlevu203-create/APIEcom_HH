@@ -38,6 +38,16 @@ def _gold_chain_length(src: str) -> int:
     return len([line for line in m.group(1).splitlines() if line.strip().startswith("(")])
 
 
+def _gold_overrides(src: str) -> dict:
+    m = re.search(r"GOLD_SCRIPT_TIMEOUT_OVERRIDES\s*=\s*\{(.*?)\n\}", src, re.DOTALL)
+    assert m, "could not find GOLD_SCRIPT_TIMEOUT_OVERRIDES in run_production_cycle.py"
+    overrides = dict((k, int(v)) for k, v in re.findall(r'"([^"]+)"\s*:\s*(\d+)', m.group(1)))
+    chain = re.search(r"GOLD_CHAIN\s*=\s*\[(.*?)\n\]", src, re.DOTALL).group(1)
+    for script in overrides:
+        assert f'"{script}"' in chain, f"override for {script} does not match any GOLD_CHAIN script"
+    return overrides
+
+
 def _job_timeout_minutes(src: str) -> int:
     # last (active, uncommented) timeout-minutes: wins — matches what
     # GitHub Actions itself parses.
@@ -52,13 +62,15 @@ def test_job_timeout_exceeds_summed_stage_budget():
     healthcheck = _int_constant(CYCLE_SRC, "HEALTHCHECK_TIMEOUT_SECONDS")
     gold_script = _int_constant(CYCLE_SRC, "GOLD_SCRIPT_TIMEOUT_SECONDS")
     gold_script_count = _gold_chain_length(CYCLE_SRC)
+    gold_overrides = _gold_overrides(CYCLE_SRC)
 
     # Worst case: every stage independently uses its FULL budget. Real
     # runs are much faster (Gold scripts fail/succeed in seconds, not
     # 600s each) — this is deliberately the pessimistic ceiling, not a
     # typical-case estimate, because a timeout bound only means
     # something if it's sized against the worst case it's meant to catch.
-    stage_budget_seconds = ingestion + reconciliation + healthcheck + gold_script * gold_script_count
+    gold_total = gold_script * (gold_script_count - len(gold_overrides)) + sum(gold_overrides.values())
+    stage_budget_seconds = ingestion + reconciliation + healthcheck + gold_total
 
     job_timeout_seconds = _job_timeout_minutes(WORKFLOW_SRC) * 60
 
@@ -66,7 +78,7 @@ def test_job_timeout_exceeds_summed_stage_budget():
         f"GitHub job timeout ({job_timeout_seconds}s) must exceed the summed "
         f"worst-case stage budget ({stage_budget_seconds}s = ingestion {ingestion}s "
         f"+ reconciliation {reconciliation}s + healthcheck {healthcheck}s + "
-        f"{gold_script_count} Gold scripts * {gold_script}s each), with real margin "
+        f"{gold_script_count} Gold scripts = {gold_total}s incl. overrides {gold_overrides}), with real margin "
         f"for setup/checkout/dependency-install/log-upload — not just barely more. "
         f"This exact scenario (job timeout == stage budget sum) cancelled a real "
         f"production run a few seconds before completion on 2026-09-22."
@@ -93,7 +105,8 @@ def test_p11_quinque_expected_stage_values():
     assert _int_constant(CYCLE_SRC, "RECONCILIATION_TIMEOUT_SECONDS") == 6000
     assert _int_constant(CYCLE_SRC, "HEALTHCHECK_TIMEOUT_SECONDS") == 120
     assert _gold_chain_length(CYCLE_SRC) == 7
-    assert _job_timeout_minutes(WORKFLOW_SRC) == 240
+    assert _job_timeout_minutes(WORKFLOW_SRC) == 250
+    assert _gold_overrides(CYCLE_SRC) == {"_p6a_gold_build.py": 1200}
 
 
 def test_domain_worker_timeout_selection():

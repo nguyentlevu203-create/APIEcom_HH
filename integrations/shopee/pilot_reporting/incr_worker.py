@@ -491,6 +491,17 @@ AMS_DATE_NOT_READY_MARKERS = (
 )
 
 
+class AmsSourceNotReady(RuntimeError):
+    """P11-FIX-4 — AMS has not published ANY requested day yet (every day
+    hit the "date not ready" error class). Nothing was written and
+    sync_state must not move, but this is the source's own publishing
+    lag, not a failure: main() reports SOURCE_NOT_READY instead of FAIL.
+    Proven live (run 35948968552, 09:51 ICT): the only due day was
+    D-1 and AMS had not published it yet — P11-HEAL counted that as a
+    hard FAIL. Freshness is still guarded by mart.v_ai_source_coverage
+    (SOURCE_LAGGING -> STALE) if AMS stays unpublished for days."""
+
+
 def _is_ams_date_not_ready(message) -> bool:
     """True only for the specific class of AMS error_param that means
     "no data published for this date yet" — never for a real failure
@@ -498,6 +509,22 @@ def _is_ams_date_not_ready(message) -> bool:
     still fail the whole call exactly as before."""
     text = str(message or "").lower()
     return any(marker in text for marker in AMS_DATE_NOT_READY_MARKERS)
+
+
+# P11-FIX-4 — stricter subset for SOURCE_NOT_READY. The broad markers
+# above only decide where a multi-day catch-up STOPS (earlier days are
+# still kept). Reporting a whole call as "not published yet" instead of
+# FAIL needs the publish-lag wording itself: "invalid time range" alone
+# could also be a genuinely malformed request, which must stay a FAIL.
+AMS_PUBLISH_LAG_MARKERS = (
+    "data has not been updated",
+    "latest data date",
+)
+
+
+def _is_ams_publish_lag(message) -> bool:
+    text = str(message or "").lower()
+    return any(marker in text for marker in AMS_PUBLISH_LAG_MARKERS)
 
 
 def _ams_compute_catchup_days(window_start, window_end, now, target_date=None):
@@ -527,26 +554,30 @@ def _run_ams_catchup(days, process_day, log):
     already succeeded THIS call. Any other error propagates immediately
     (unchanged failure behavior — e.g. a 429 that exhausted its retry
     budget must still fail the whole call, not be silently treated as
-    partial success). Raises if zero days completed — no artificial
+    partial success). Raises AmsSourceNotReady if zero days completed
+    because the very first day is not published yet — no artificial
     sync_state advancement over a call that made no real progress.
 
     Returns the last successfully completed date."""
     last_completed_date = None
+    stop_error = None
     for d in days:
         try:
             process_day(d)
         except RuntimeError as e:
             if not _is_ams_date_not_ready(str(e)):
                 raise
+            stop_error = str(e)
             log(f"AMS date not ready yet for {d.isoformat()} ({e}) — "
                 f"stopping catch-up here, keeping {days.index(d)} earlier day(s) already written this run")
             break
         last_completed_date = d
 
     if last_completed_date is None:
-        raise RuntimeError(
-            f"AMS reports not available for any requested day ({days[0]}..{days[-1]})"
-        )
+        message = f"AMS reports not available for any requested day ({days[0]}..{days[-1]})"
+        if _is_ams_publish_lag(stop_error):
+            raise AmsSourceNotReady(message)
+        raise RuntimeError(f"{message}: {stop_error}")
     return last_completed_date
 
 
@@ -1060,6 +1091,12 @@ def main() -> int:
         conn.commit()
         conn.close()
         print(json.dumps({"status": "PASS", "result": result}, default=str))
+        return 0
+    except AmsSourceNotReady as e:
+        # Nothing was written; roll back so sync_state stays where it was.
+        conn.rollback()
+        conn.close()
+        print(json.dumps({"status": ic.SOURCE_NOT_READY_STATUS, "note": str(e)}, default=str))
         return 0
     except Exception as e:  # noqa: BLE001
         conn.rollback()

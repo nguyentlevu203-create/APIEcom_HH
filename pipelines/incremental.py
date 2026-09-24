@@ -178,6 +178,16 @@ def run_domain(source_system: str, domain: str, shop_id: str, force: bool) -> di
             "cadence_minutes": cadence, "etl_run_id": etl_run_id, "result": worker_result.get("result"),
         }
 
+    if proc.returncode == 0 and worker_result and worker_result.get("status") == ic.SOURCE_NOT_READY_STATUS:
+        # P11-FIX-4 — source has published nothing for the requested
+        # range yet; worker wrote nothing and left sync_state unchanged.
+        note = f"{ic.SOURCE_NOT_READY_STATUS}: {worker_result.get('note') or 'source has not published the requested range yet'}"
+        ic.finish_run_log(source_system, domain, etl_run_id, "success", 0, note)
+        return {
+            "status": ic.SOURCE_NOT_READY_STATUS, "window_start": window_start.isoformat(), "window_note": window_note,
+            "cadence_minutes": cadence, "etl_run_id": etl_run_id, "note": worker_result.get("note"),
+        }
+
     if proc.returncode == 0 and worker_result and worker_result.get("status") == ic.PARTIAL_CATCHUP_STATUS:
         # P11-LAST-MILE — durable progress was committed (sync_state
         # already advanced to catchup.last_committed_end by the worker

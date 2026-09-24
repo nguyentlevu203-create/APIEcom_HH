@@ -61,6 +61,19 @@ PY = sys.executable
 # what that stage actually does; none of them is "no timeout".
 INGESTION_TIMEOUT_SECONDS = 3600  # covers realistic multi-day catch-up across all domains
 GOLD_SCRIPT_TIMEOUT_SECONDS = 600  # one Gold/PNL script, DB-only, no external API calls
+# P11-FIX-4 — targeted, like the per-domain overrides: _p6a_gold_build.py
+# rebuilds full history and was measured at 514s -> 561s -> TIMEOUT at
+# 600s (run 35948968552). Its row-by-row upsert is now batched
+# (_gold_ownership.guarded_upsert), which should remove most of that;
+# 1200s is headroom while that is confirmed live. Every other script
+# keeps 600s.
+GOLD_SCRIPT_TIMEOUT_OVERRIDES = {
+    "_p6a_gold_build.py": 1200,
+}
+
+
+def gold_script_timeout(script: str) -> int:
+    return GOLD_SCRIPT_TIMEOUT_OVERRIDES.get(script, GOLD_SCRIPT_TIMEOUT_SECONDS)
 # P11-QUINQUE Q6 — proven live (P11-QUATER-LIVE, run 35706413067):
 # reconciliation ran cleanly for the full 1800s and was still mid TikTok/
 # finance D-3 work when the stage timeout cut it off — a cumulative
@@ -250,6 +263,31 @@ def parse_recon_timing_markers(stdout: str) -> dict:
 
 
 INCREMENTAL_RESULT_MARKER = "HH_INCREMENTAL_RESULT_JSON="
+TIKTOK_ORDERS_CHUNK_MARKER = "HH_TIKTOK_ORDERS_CHUNK_JSON="
+TIKTOK_ORDERS_CATCHUP_MARKER = "HH_TIKTOK_ORDERS_CATCHUP_JSON="
+
+
+def parse_tiktok_orders_markers(stdout: str) -> dict:
+    """P11-FIX-4 — the TikTok orders worker flushes one
+    HH_TIKTOK_ORDERS_CHUNK_JSON= line per durably committed chunk and one
+    HH_TIKTOK_ORDERS_CATCHUP_JSON= summary. Run 35948968552 proved these
+    were lost: only a 4KB stdout tail was ever persisted. Read from FULL
+    ingestion stdout so every committed chunk lands in the cycle JSON —
+    including chunks committed before a worker timeout kill."""
+    chunks: list[dict] = []
+    catchup = None
+    for line in stdout.splitlines():
+        if line.startswith(TIKTOK_ORDERS_CHUNK_MARKER):
+            try:
+                chunks.append(json.loads(line[len(TIKTOK_ORDERS_CHUNK_MARKER):]))
+            except (json.JSONDecodeError, ValueError):
+                pass
+        elif line.startswith(TIKTOK_ORDERS_CATCHUP_MARKER):
+            try:
+                catchup = json.loads(line[len(TIKTOK_ORDERS_CATCHUP_MARKER):])
+            except (json.JSONDecodeError, ValueError):
+                pass
+    return {"chunks": chunks, "catchup": catchup}
 
 
 def parse_incremental_marker(stdout: str) -> dict | None:
@@ -388,11 +426,14 @@ def run_ingestion() -> dict:
 
     finished_at = now_iso()
     full_stdout = r.stdout or ""
+    tiktok_orders = parse_tiktok_orders_markers(full_stdout)
     base = {
         "label": "incremental_ingestion", "started_at": started_at, "finished_at": finished_at,
         "returncode": r.returncode,
         "stdout_tail": full_stdout[-4000:],
         "stderr_tail": (r.stderr or "")[-2000:] if r.returncode != 0 else None,
+        "tiktok_orders_chunks": tiktok_orders["chunks"],
+        "tiktok_orders_catchup": tiktok_orders["catchup"],
     }
 
     if timed_out:
@@ -437,7 +478,7 @@ def run_gold_chain() -> list[dict]:
     steps = []
     for label, script in GOLD_CHAIN:
         steps.append(run_subprocess(
-            label, [PY, str(GOLD_DIR / script)], GOLD_DIR, GOLD_SCRIPT_TIMEOUT_SECONDS,
+            label, [PY, str(GOLD_DIR / script)], GOLD_DIR, gold_script_timeout(script),
         ))
     return steps
 
@@ -457,7 +498,7 @@ def compute_recon_stage_status(timed_out: bool, returncode, parsed: dict) -> tup
     if timed_out or not isinstance(summary, dict):
         failed = [
             f"{t.get('source_system')}/{t.get('domain')}:{t.get('window')}"
-            for t in parsed.get("domain_timings", []) if t.get("status") != "PASS"
+            for t in parsed.get("domain_timings", []) if not ic.is_domain_ok(t.get("status"))
         ]
         return ("TIMEOUT" if timed_out else "RESULT_UNPARSEABLE"), failed
     if "failed_domain_count" not in summary:
@@ -568,6 +609,14 @@ def main():
         print(f"  failed domain(s): {', '.join(ingestion['ingestion_failed_domains'])}")
     if ingestion.get("ingestion_partial_catchup_domains"):
         print(f"  partial catch-up domain(s): {', '.join(ingestion['ingestion_partial_catchup_domains'])}")
+    for i, c in enumerate(ingestion.get("tiktok_orders_chunks") or [], 1):
+        print(f"  TIKTOK/orders chunk {i}: {c.get('chunk_start')}..{c.get('chunk_end')} "
+              f"{c.get('duration_seconds')}s seen={c.get('orders_seen')} ins={c.get('orders_inserted')} "
+              f"upd={c.get('orders_updated')} committed={c.get('committed')}")
+    if ingestion.get("tiktok_orders_catchup"):
+        tc = ingestion["tiktok_orders_catchup"]
+        print(f"  TIKTOK/orders catch-up: {tc.get('status')} {tc.get('chunks_completed')}/{tc.get('chunks_total')} "
+              f"chunks, last_committed_end={tc.get('last_committed_end')}")
     if ingestion["status"] == "TIMEOUT":
         # P11-TER.5 — we just terminated incremental.py's whole process
         # group (see run_contained_subprocess), so any row it started
@@ -648,6 +697,8 @@ def main():
     log["ingestion_domain_results"] = ingestion.get("ingestion_domain_results", {})
     log["ingestion_failed_domains"] = ingestion.get("ingestion_failed_domains", [])
     log["ingestion_partial_catchup_domains"] = ingestion.get("ingestion_partial_catchup_domains", [])
+    log["tiktok_orders_chunks"] = ingestion.get("tiktok_orders_chunks", [])
+    log["tiktok_orders_catchup"] = ingestion.get("tiktok_orders_catchup")
     log["ingestion_required_failure_count"] = len(ingestion.get("ingestion_failed_domains", []))
 
     log_path = LOG_DIR / f"cycle_{cycle_started_at.replace(':', '-')}.json"

@@ -100,3 +100,29 @@ def test_run_domain_timeout_reports_durably_committed_chunks(monkeypatch):
 def test_run_domain_timeout_without_markers_unchanged(monkeypatch):
     res, _ = _run_domain(monkeypatch, "", returncode=-9, timed_out=True)
     assert "committed_chunks" not in res and "last_committed_end" not in res
+
+
+# =====================================================================
+# P11-FIX-4 — SOURCE_NOT_READY (e.g. Shopee AMS D-1 not published yet)
+# =====================================================================
+
+def test_source_not_ready_is_ok_for_verdict():
+    assert ic.is_domain_ok(ic.SOURCE_NOT_READY_STATUS)
+    verdict = ic.compute_ingestion_verdict({"SHOPEE/affiliate_ams": {"status": "SOURCE_NOT_READY"}})
+    assert verdict["process_status"] == "PASS"
+    assert verdict["failed_domains"] == [] and verdict["partial_catchup_domains"] == []
+
+
+def test_run_domain_source_not_ready(monkeypatch):
+    stdout = json.dumps({"status": "SOURCE_NOT_READY",
+                         "note": "AMS reports not available for any requested day (2026-09-23..2026-09-23)"})
+    res, finished = _run_domain(monkeypatch, stdout)
+    assert res["status"] == "SOURCE_NOT_READY"
+    assert finished == [("success", 0, "SOURCE_NOT_READY: AMS reports not available for any requested day "
+                                       "(2026-09-23..2026-09-23)")]
+
+
+def test_run_domain_source_not_ready_with_nonzero_exit_is_fail(monkeypatch):
+    res, finished = _run_domain(monkeypatch, json.dumps({"status": "SOURCE_NOT_READY"}), returncode=1)
+    assert res["status"] == "FAIL"
+    assert finished[0][0] == "fail"

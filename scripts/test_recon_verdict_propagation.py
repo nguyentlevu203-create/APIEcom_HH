@@ -116,3 +116,50 @@ def test_partial_catchup_ingestion_is_red_with_distinct_reason():
     assert verdict == "RED"
     assert reasons == ["INGESTION_DOMAIN_PARTIAL_CATCHUP:TIKTOK/orders"]
     assert "INGESTION_PROCESS_FAILED" not in reasons
+
+
+# =====================================================================
+# P11-FIX-4
+# =====================================================================
+
+def test_timeout_path_does_not_count_source_not_ready_as_failure():
+    stdout = "\n".join([
+        _timing("D1", "SHOPEE", "affiliate_ams", "SOURCE_NOT_READY"),
+        _timing("D1", "TIKTOK", "finance", "FAIL"),
+    ])
+    recon = _stage(stdout, returncode=-9, timed_out=True)
+    assert recon["reconciliation_failed_domains"] == ["TIKTOK/finance:D1"]
+
+
+def test_completed_recon_with_only_not_ready_is_success():
+    stdout = "\n".join([_timing("D1", "SHOPEE", "affiliate_ams", "SOURCE_NOT_READY"), _final([])])
+    assert _stage(stdout)["status"] == "SUCCESS"
+
+
+def test_tiktok_orders_chunk_markers_are_parsed_from_full_stdout():
+    filler = "x" * 10_000  # well past the 4KB tail that used to be the only persisted stdout
+    chunk = {"chunk_start": "2026-09-17T09:57:12+00:00", "chunk_end": "2026-09-17T13:57:12+00:00",
+             "duration_seconds": 30.1, "orders_seen": 40, "orders_inserted": 1, "orders_updated": 39,
+             "items_inserted": 1, "items_updated": 70, "committed": True}
+    stdout = "\n".join([
+        rpc.TIKTOK_ORDERS_CHUNK_MARKER + json.dumps(chunk),
+        filler,
+        rpc.TIKTOK_ORDERS_CHUNK_MARKER + json.dumps({**chunk, "chunk_end": "2026-09-17T17:57:12+00:00"}),
+        rpc.TIKTOK_ORDERS_CHUNK_MARKER + "{not json",
+        rpc.TIKTOK_ORDERS_CATCHUP_MARKER + json.dumps({"status": "PARTIAL_CATCHUP", "chunks_completed": 2}),
+        filler,
+    ])
+    parsed = rpc.parse_tiktok_orders_markers(stdout)
+    assert [c["chunk_end"] for c in parsed["chunks"]] == ["2026-09-17T13:57:12+00:00", "2026-09-17T17:57:12+00:00"]
+    assert parsed["catchup"] == {"status": "PARTIAL_CATCHUP", "chunks_completed": 2}
+
+
+def test_no_tiktok_orders_markers():
+    assert rpc.parse_tiktok_orders_markers("nothing here\n") == {"chunks": [], "catchup": None}
+
+
+def test_gold_script_timeout_is_targeted():
+    assert rpc.gold_script_timeout("_p6a_gold_build.py") == 1200
+    for _, script in rpc.GOLD_CHAIN:
+        if script != "_p6a_gold_build.py":
+            assert rpc.gold_script_timeout(script) == 600
