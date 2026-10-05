@@ -290,6 +290,60 @@ def parse_tiktok_orders_markers(stdout: str) -> dict:
     return {"chunks": chunks, "catchup": catchup}
 
 
+# P11 RECOVERY D — flushed per-domain / per-phase markers from
+# pipelines/incremental.py and the TikTok worker. Only these whitelisted
+# structured lines are ever persisted beyond the 4KB stdout tail.
+INGEST_DOMAIN_START_MARKER = "HH_INGEST_DOMAIN_START_JSON="
+INGEST_DOMAIN_END_MARKER = "HH_INGEST_DOMAIN_END_JSON="
+INGEST_DOMAIN_FINALIZED_MARKER = "HH_INGEST_DOMAIN_FINALIZED_JSON="
+TIKTOK_WORKER_PHASE_MARKER = "HH_TIKTOK_WORKER_PHASE_JSON="
+_INGEST_MARKERS = {
+    INGEST_DOMAIN_START_MARKER: "start", INGEST_DOMAIN_END_MARKER: "end",
+    INGEST_DOMAIN_FINALIZED_MARKER: "finalized", TIKTOK_WORKER_PHASE_MARKER: "worker_phase",
+}
+
+
+def parse_ingest_domain_markers(stdout: str) -> dict:
+    """Per-domain timeline (keyed by etl_run_id, in start order) plus where
+    ingestion was when it stopped: the domain whose START has no END is
+    still inside its worker; one with END but no FINALIZED was finalizing
+    its run-log row. Works on partial stdout from a killed stage."""
+    events: list[dict] = []
+    timeline: dict[str, dict] = {}
+    for line in stdout.splitlines():
+        for prefix, kind in _INGEST_MARKERS.items():
+            if line.startswith(prefix):
+                try:
+                    payload = json.loads(line[len(prefix):])
+                except (json.JSONDecodeError, ValueError):
+                    break
+                if not isinstance(payload, dict):
+                    break
+                events.append({"marker": kind, **payload})
+                rid = payload.get("etl_run_id")
+                if not rid:
+                    break
+                entry = timeline.setdefault(rid, {"etl_run_id": rid})
+                if kind == "worker_phase":
+                    entry["last_worker_phase"] = payload.get("phase")
+                    entry["last_worker_phase_elapsed_seconds"] = payload.get("elapsed_seconds")
+                else:
+                    for k in ("source_system", "domain", "worker_timeout", "started_at", "finished_at",
+                              "elapsed_seconds", "returncode", "timed_out", "status"):
+                        if payload.get(k) is not None:
+                            entry[k] = payload[k]
+                    entry[f"{kind}_seen"] = True
+                break
+    inflight = None
+    for entry in timeline.values():
+        if entry.get("start_seen") and not entry.get("end_seen"):
+            inflight = {**entry, "stage": "IN_WORKER"}
+        elif entry.get("end_seen") and not entry.get("finalized_seen"):
+            inflight = {**entry, "stage": "FINALIZING_RUN_LOG"}
+    return {"events": events, "timeline": list(timeline.values()), "inflight": inflight,
+            "last_event": events[-1] if events else None}
+
+
 def parse_incremental_marker(stdout: str) -> dict | None:
     """P11-SEXTUS Q3/Q9 — the only accepted way to read
     pipelines/incremental.py's machine-readable verdict: its exact
@@ -426,8 +480,10 @@ def run_ingestion() -> dict:
     stdout to parse."""
     started_at = now_iso()
     try:
+        # Unbuffered: whatever incremental.py printed before an outer
+        # kill must still be in the captured pipe (run 37262150230 lost it).
         r, timed_out = ic.run_contained_subprocess(
-            [PY, "pipelines/incremental.py"], ROOT, INGESTION_TIMEOUT_SECONDS,
+            [PY, "pipelines/incremental.py"], ROOT, INGESTION_TIMEOUT_SECONDS, env=ic.unbuffered_env(),
         )
     except Exception as e:  # noqa: BLE001
         return {
@@ -448,6 +504,13 @@ def run_ingestion() -> dict:
         "tiktok_orders_chunks": tiktok_orders["chunks"],
         "tiktok_orders_catchup": tiktok_orders["catchup"],
     }
+    domain_markers = parse_ingest_domain_markers(full_stdout)
+    base.update({
+        "ingestion_markers": domain_markers["events"],
+        "ingestion_domain_timeline": domain_markers["timeline"],
+        "ingestion_inflight_domain": domain_markers["inflight"],
+        "ingestion_last_marker": domain_markers["last_event"],
+    })
 
     if timed_out:
         base.update({
@@ -630,6 +693,16 @@ def main():
         tc = ingestion["tiktok_orders_catchup"]
         print(f"  TIKTOK/orders catch-up: {tc.get('status')} {tc.get('chunks_completed')}/{tc.get('chunks_total')} "
               f"chunks, last_committed_end={tc.get('last_committed_end')}")
+    for t in ingestion.get("ingestion_domain_timeline") or []:
+        print(f"  {t.get('source_system')}/{t.get('domain')}: {t.get('status')} {t.get('elapsed_seconds')}s"
+              f" worker_timeout={t.get('worker_timeout')}"
+              + (f" last_worker_phase={t['last_worker_phase']}" if t.get("last_worker_phase") else ""))
+    if ingestion.get("ingestion_inflight_domain"):
+        f = ingestion["ingestion_inflight_domain"]
+        print(f"  IN-FLIGHT when ingestion stopped: {f.get('source_system')}/{f.get('domain')} "
+              f"stage={f.get('stage')} etl_run_id={f.get('etl_run_id')} last_worker_phase={f.get('last_worker_phase')}")
+    markers_path = LOG_DIR / f"ingestion_markers_{cycle_started_at.replace(':', '-')}.jsonl"
+    markers_path.write_text("".join(json.dumps(e, default=str) + "\n" for e in ingestion.get("ingestion_markers") or []))
     if ingestion["status"] == "TIMEOUT":
         # P11-TER.5 — we just terminated incremental.py's whole process
         # group (see run_contained_subprocess), so any row it started
@@ -713,6 +786,8 @@ def main():
     log["tiktok_orders_chunks"] = ingestion.get("tiktok_orders_chunks", [])
     log["tiktok_orders_catchup"] = ingestion.get("tiktok_orders_catchup")
     log["ingestion_required_failure_count"] = len(ingestion.get("ingestion_failed_domains", []))
+    log["ingestion_domain_timeline"] = ingestion.get("ingestion_domain_timeline", [])
+    log["ingestion_inflight_domain"] = ingestion.get("ingestion_inflight_domain")
 
     log_path = LOG_DIR / f"cycle_{cycle_started_at.replace(':', '-')}.json"
     log_path.write_text(json.dumps(log, indent=2, default=str))

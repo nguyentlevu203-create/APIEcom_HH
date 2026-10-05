@@ -166,9 +166,18 @@ jobs:
           TIKTOK_TOKENS_JSON: ${{ secrets.TIKTOK_TOKENS_JSON }}
           TIKTOK_SHOP_INFO_JSON: ${{ secrets.TIKTOK_SHOP_INFO_JSON }}
 
+      - name: Provision runner-local token state directory
+        # P11 RECOVERY D — integrations/shopee/runtime_token_state.py keeps
+        # the latest rotated Shopee/AMS bundle here (0600 files, atomic
+        # replace) so later worker subprocesses of this job don't refresh
+        # again from the stale job-start env bundle. Outside the repo,
+        # never uploaded, removed if: always() below.
+        run: install -d -m 700 "$RUNNER_TEMP/hh-token-state"
+
       - name: Run production cycle (CORE -> GOLD -> reconcile -> healthcheck)
         run: python3 scripts/run_production_cycle.py
         env:
+          HH_TOKEN_STATE_DIR: ${{ runner.temp }}/hh-token-state
           HH_ETL_WRITER_DATABASE_URL: ${{ secrets.HH_ETL_WRITER_DATABASE_URL }}
           HH_NEONDB_OWNER_DATABASE_URL: ${{ secrets.HH_NEONDB_OWNER_DATABASE_URL }}
           SHOPEE_LIVE_PARTNER_KEY: ${{ secrets.SHOPEE_LIVE_PARTNER_KEY }}
@@ -210,7 +219,9 @@ jobs:
         # longer than needed" convention, and matters if this workflow
         # is ever pointed at a self-hosted/reused runner later.
         if: always()
-        run: rm -f integrations/tiktok_shop/tokens.json integrations/tiktok_shop/shop_info.json
+        run: |
+          rm -f integrations/tiktok_shop/tokens.json integrations/tiktok_shop/shop_info.json
+          rm -rf "$RUNNER_TEMP/hh-token-state"
 
       - name: Upload cycle logs (observability, D4)
         if: always()

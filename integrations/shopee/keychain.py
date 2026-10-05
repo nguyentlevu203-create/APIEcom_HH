@@ -16,6 +16,7 @@ from typing import Optional
 import keyring
 
 from config import KEYCHAIN_SERVICE
+from runtime_token_state import RuntimeTokenStateError, read_state as read_runtime_state, write_state as write_runtime_state
 
 # Keychain account names (not secret themselves — just labels)
 ACCOUNT_LIVE_PARTNER_KEY = "LIVE_PARTNER_KEY"
@@ -47,7 +48,14 @@ class CredentialPersistenceCriticalFailure(RuntimeError):
 def _bundled_rotating_state() -> Optional[dict]:
     """Parse SHOPEE_TOKEN_STATE_JSON if present. Malformed or non-object
     content is treated the same as absent (falls through to legacy/keychain)
-    rather than raising, since a bad env var must never crash the read path."""
+    rather than raising, since a bad env var must never crash the read path.
+
+    P11 RECOVERY D — on GitHub Actions a valid runner-local state file
+    (runtime_token_state, written by an earlier worker's refresh in this
+    same job) takes precedence over the job-start env bundle."""
+    local = read_runtime_state("SHOPEE_TOKEN_STATE_JSON")
+    if local is not None:
+        return local
     raw = os.environ.get("SHOPEE_TOKEN_STATE_JSON")
     if not raw:
         return None
@@ -139,6 +147,13 @@ def persist_rotating_state(
     # in-flight ShopeeClient request is about to make) must see the fresh
     # token regardless of whether the durable write below succeeds.
     os.environ["SHOPEE_TOKEN_STATE_JSON"] = state_json
+    # P11 RECOVERY D — later worker subprocesses of this job read this
+    # file instead of the stale job-start env bundle.
+    try:
+        write_runtime_state("SHOPEE_TOKEN_STATE_JSON", state_json)
+    except RuntimeTokenStateError as exc:
+        del state_json
+        raise CredentialPersistenceCriticalFailure(str(exc)) from None
     ok = put_secret_with_retry("SHOPEE_TOKEN_STATE_JSON", state_json, repo, writer_token)
     del state_json
     if not ok:

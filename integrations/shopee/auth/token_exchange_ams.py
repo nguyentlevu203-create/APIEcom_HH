@@ -41,6 +41,11 @@ import requests
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from config import API_HOST, KEYCHAIN_SERVICE, TOKEN_GET_PATH  # noqa: E402
 from keychain import CredentialPersistenceCriticalFailure  # noqa: E402
+from runtime_token_state import (  # noqa: E402
+    RuntimeTokenStateError,
+    read_state as read_runtime_state,
+    write_state as write_runtime_state,
+)
 
 AMS_PARTNER_ID = 2044772  # "Affiliate for order" app, Live Partner_id (open.shopee.com/console/app/241801)
 
@@ -78,6 +83,12 @@ _ROTATING_JSON_KEYS_AMS = {
 
 
 def _bundled_ams_rotating_state():
+    # P11 RECOVERY D — same runner-local precedence as the main app: a
+    # refresh in an earlier AMS worker of this job (incremental, then
+    # reconciliation D1/D3/D7) must be visible to the later ones.
+    local = read_runtime_state("SHOPEE_AMS_TOKEN_STATE_JSON")
+    if local is not None:
+        return local
     raw = os.environ.get("SHOPEE_AMS_TOKEN_STATE_JSON")
     if not raw:
         return None
@@ -156,6 +167,11 @@ def persist_ams_rotating_state(
         }
     )
     os.environ["SHOPEE_AMS_TOKEN_STATE_JSON"] = state_json
+    try:
+        write_runtime_state("SHOPEE_AMS_TOKEN_STATE_JSON", state_json)
+    except RuntimeTokenStateError as exc:
+        del state_json
+        raise CredentialPersistenceCriticalFailure(str(exc)) from None
     ok = put_secret_with_retry("SHOPEE_AMS_TOKEN_STATE_JSON", state_json, repo, writer_token)
     del state_json
     if not ok:

@@ -13,6 +13,8 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import incr_common as ic  # noqa: E402
 import incremental  # noqa: E402
@@ -58,8 +60,13 @@ def _run_domain(monkeypatch, stdout, returncode=0, timed_out=False):
     monkeypatch.setattr(incremental.ic, "start_run_log", lambda *a, **k: "run-id")
     monkeypatch.setattr(incremental.ic, "finish_run_log",
                         lambda ss, d, rid, status, rows=0, err="": finished.append((status, rows, err)))
-    monkeypatch.setattr(incremental.ic, "run_contained_subprocess",
+    # run_domain() streams worker output (P11 RECOVERY D); the old helper
+    # must never be reached either, so a future rename can't spawn a real
+    # worker against real credentials from a unit test.
+    monkeypatch.setattr(incremental.ic, "run_streaming_contained_subprocess",
                         lambda args, cwd, timeout: (subprocess.CompletedProcess(args, returncode, stdout, ""), timed_out))
+    monkeypatch.setattr(incremental.ic, "run_contained_subprocess",
+                        lambda *a, **k: pytest.fail("unit test reached a real subprocess helper"))
     return incremental.run_domain("TIKTOK", "orders", "shop-1", force=True), finished
 
 

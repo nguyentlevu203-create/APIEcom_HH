@@ -137,13 +137,27 @@ def run_domain(source_system: str, domain: str, shop_id: str, force: bool) -> di
 
     worker = WORKER_BY_SYSTEM[source_system]
     worker_timeout = DOMAIN_TIMEOUT_SECONDS.get((source_system, domain), DEFAULT_WORKER_TIMEOUT_SECONDS)
-    proc, timed_out = ic.run_contained_subprocess(
+    marker_base = {"source_system": source_system, "domain": domain, "etl_run_id": etl_run_id,
+                   "worker_timeout": worker_timeout}
+    started_at = ic.now_utc()
+    ic.emit_marker(INGEST_DOMAIN_START_MARKER, {
+        **marker_base, "started_at": started_at.isoformat(), "finished_at": None, "elapsed_seconds": None,
+        "returncode": None, "timed_out": None, "status": "STARTED",
+    })
+    # P11 RECOVERY D — worker output is relayed live (and still captured
+    # in full for parsing below), so a later outer kill can no longer
+    # swallow it.
+    proc, timed_out = ic.run_streaming_contained_subprocess(
         [sys.executable, str(worker), domain, window_start.isoformat(), now.isoformat(), etl_run_id],
         worker.parent, worker_timeout,
     )
-    print(proc.stdout, end="")
-    if proc.stderr:
-        print(proc.stderr, file=sys.stderr, end="")
+    finished_at = ic.now_utc()
+    ic.emit_marker(INGEST_DOMAIN_END_MARKER, {
+        **marker_base, "started_at": started_at.isoformat(), "finished_at": finished_at.isoformat(),
+        "elapsed_seconds": round((finished_at - started_at).total_seconds(), 3),
+        "returncode": proc.returncode, "timed_out": timed_out,
+        "status": _worker_status_hint(timed_out, proc.stdout or ""),
+    })
 
     if timed_out:
         # P11-TER.4/5 — a plain subprocess.run(timeout=...) here would
@@ -220,6 +234,33 @@ def run_domain(source_system: str, domain: str, shop_id: str, force: bool) -> di
 TIKTOK_ORDERS_CHUNK_MARKER = "HH_TIKTOK_ORDERS_CHUNK_JSON="
 
 
+# P11 RECOVERY D — flushed per-domain markers. START once the run-log row
+# exists, END the moment the worker process has returned (before
+# finish_run_log), FINALIZED after run_domain() has fully returned. The
+# last marker seen tells the orchestrator where a killed ingestion stage
+# was: inside a worker (START only), finalizing its run-log row (END, no
+# FINALIZED), or between domains (FINALIZED).
+INGEST_DOMAIN_START_MARKER = "HH_INGEST_DOMAIN_START_JSON="
+INGEST_DOMAIN_END_MARKER = "HH_INGEST_DOMAIN_END_JSON="
+INGEST_DOMAIN_FINALIZED_MARKER = "HH_INGEST_DOMAIN_FINALIZED_JSON="
+
+
+def _worker_status_hint(timed_out: bool, stdout: str) -> str:
+    """Status as reported by the worker itself (last JSON line), for the
+    END marker only — run_domain() still decides the domain outcome."""
+    if timed_out:
+        return "TIMEOUT"
+    for line in reversed(stdout.strip().splitlines()):
+        try:
+            parsed = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if isinstance(parsed, dict) and parsed.get("status"):
+            return str(parsed["status"])
+        break
+    return "RESULT_UNPARSEABLE"
+
+
 def _committed_chunk_progress(stdout: str) -> dict:
     """Counts HH_TIKTOK_ORDERS_CHUNK_JSON= markers (one per durably
     committed chunk) in a worker's stdout. Empty dict when there are
@@ -274,7 +315,13 @@ def main() -> int:
         if not shop_id:
             results[f"{source_system}/{domain}"] = {"status": "FAIL", "error": f"no shop_id for {source_system}"}
             continue
-        results[f"{source_system}/{domain}"] = run_domain(source_system, domain, shop_id, args.force)
+        domain_result = run_domain(source_system, domain, shop_id, args.force)
+        results[f"{source_system}/{domain}"] = domain_result
+        if domain_result.get("etl_run_id"):
+            ic.emit_marker(INGEST_DOMAIN_FINALIZED_MARKER, {
+                "source_system": source_system, "domain": domain, "etl_run_id": domain_result["etl_run_id"],
+                "finished_at": ic.now_utc().isoformat(), "status": domain_result.get("status"),
+            })
 
     if not only or ("TIKTOK", "ads") in only:
         results["TIKTOK/ads"] = run_tiktok_ads_skip()
@@ -292,7 +339,7 @@ def main() -> int:
     # have.
     verdict = ic.compute_ingestion_verdict(results)
     marker_payload = {"domains": results, **verdict}
-    print(f"HH_INCREMENTAL_RESULT_JSON={json.dumps(marker_payload, default=str)}")
+    print(f"HH_INCREMENTAL_RESULT_JSON={json.dumps(marker_payload, default=str)}", flush=True)
     return 1 if verdict["process_status"] == "FAIL" else 0
 
 

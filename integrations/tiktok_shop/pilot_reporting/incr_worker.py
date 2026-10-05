@@ -1202,6 +1202,25 @@ def reconcile_domain(cur, domain, shop_id, business_date, window_start, window_e
     return recon_rows, result
 
 
+# P11 RECOVERY D — run 37262150230: TIKTOK/finance committed sync_state
+# 36s after start, yet its run-log row stayed 'running' until the 3600s
+# ingestion stage was killed 21 minutes later. These flushed markers
+# around the incremental success path show exactly how far a worker got.
+# Safe fields only (domain, run id, phase name, timing).
+WORKER_PHASE_MARKER = "HH_TIKTOK_WORKER_PHASE_JSON="
+
+
+def _phase_emitter(domain: str, etl_run_id: str):
+    t0 = time.monotonic()
+
+    def phase(name: str) -> None:
+        _emit_marker(WORKER_PHASE_MARKER, {
+            "domain": domain, "etl_run_id": etl_run_id, "phase": name,
+            "elapsed_seconds": round(time.monotonic() - t0, 3), "at": ic.now_utc().isoformat(),
+        })
+    return phase
+
+
 def main() -> int:
     domain = sys.argv[1]
     window_start = datetime.fromisoformat(sys.argv[2])
@@ -1248,11 +1267,18 @@ def main() -> int:
             print(json.dumps({"status": "PASS", "result": result, "recon_rows": recon_rows}, default=str))
             return 0
 
+        phase = _phase_emitter(domain, etl_run_id)
         result = HANDLERS[domain](cur, etl_run_id, shop_id, window_start, window_end, log)
+        phase("handler_complete")
         ic.upsert_sync_state(cur, "TIKTOK", domain, shop_id, window_end, ic.vn_date(window_end), "success")
+        phase("sync_state_updated")
         conn.commit()
+        phase("db_commit_complete")
         conn.close()
-        print(json.dumps({"status": "PASS", "result": result}, default=str))
+        phase("db_close_complete")
+        print(json.dumps({"status": "PASS", "result": result}, default=str), flush=True)
+        phase("result_emitted")
+        phase("before_exit")
         return 0
     except Exception as e:  # noqa: BLE001
         conn.rollback()

@@ -189,7 +189,7 @@ def with_backoff(fn, label: str, log):
 PROCESS_GROUP_KILL_GRACE_SECONDS = 10
 
 
-def run_contained_subprocess(args: list[str], cwd, timeout: float):
+def run_contained_subprocess(args: list[str], cwd, timeout: float, env: Optional[dict] = None):
     """P11-TER.4 — run a subprocess (and anything it spawns) in its own
     POSIX process group/session so a timeout can be contained cleanly.
 
@@ -212,7 +212,7 @@ def run_contained_subprocess(args: list[str], cwd, timeout: float):
     """
     proc = subprocess.Popen(
         args, cwd=str(cwd), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True, start_new_session=True,
+        text=True, start_new_session=True, env=env,
     )
     try:
         stdout, stderr = proc.communicate(timeout=timeout)
@@ -236,6 +236,83 @@ def run_contained_subprocess(args: list[str], cwd, timeout: float):
         except subprocess.TimeoutExpired:
             stdout, stderr = "", ""
     return subprocess.CompletedProcess(args, proc.returncode, stdout, stderr), True
+
+
+def unbuffered_env() -> dict:
+    """Child env with PYTHONUNBUFFERED=1, so a Python child's output
+    reaches its pipe line by line instead of sitting in a block buffer
+    that is lost when the child is killed (run 37262150230: the whole
+    ingestion stdout vanished on the stage timeout)."""
+    env = dict(os.environ)
+    env["PYTHONUNBUFFERED"] = "1"
+    return env
+
+
+def run_streaming_contained_subprocess(args: list[str], cwd, timeout: float,
+                                        relay_out=None, relay_err=None):
+    """P11 RECOVERY D — same process-group containment and timeout
+    semantics as run_contained_subprocess() (SIGTERM the group, grace,
+    SIGKILL; never raises TimeoutExpired), but every stdout/stderr line
+    is relayed the moment it arrives (default: this process's own
+    stdout/stderr, flushed) while still being captured in full for the
+    caller to parse. The child runs unbuffered. Returns
+    (CompletedProcess-like, timed_out)."""
+    import sys
+    import threading
+
+    relay_out = relay_out or (lambda line: (sys.stdout.write(line), sys.stdout.flush()))
+    relay_err = relay_err or (lambda line: (sys.stderr.write(line), sys.stderr.flush()))
+    proc = subprocess.Popen(
+        args, cwd=str(cwd), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, bufsize=1, start_new_session=True, env=unbuffered_env(),
+    )
+    out_lines: list[str] = []
+    err_lines: list[str] = []
+
+    def _pump(stream, sink, relay):
+        for line in iter(stream.readline, ""):
+            sink.append(line)
+            try:
+                relay(line)
+            except Exception:  # noqa: BLE001 — relay is best-effort, capture is not
+                pass
+        stream.close()
+
+    pumps = [threading.Thread(target=_pump, args=(proc.stdout, out_lines, relay_out), daemon=True),
+             threading.Thread(target=_pump, args=(proc.stderr, err_lines, relay_err), daemon=True)]
+    for t in pumps:
+        t.start()
+
+    timed_out = False
+    try:
+        proc.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+
+        def _signal_group(sig):
+            try:
+                os.killpg(os.getpgid(proc.pid), sig)
+            except ProcessLookupError:
+                pass
+
+        _signal_group(signal.SIGTERM)
+        try:
+            proc.wait(timeout=PROCESS_GROUP_KILL_GRACE_SECONDS)
+        except subprocess.TimeoutExpired:
+            _signal_group(signal.SIGKILL)
+            try:
+                proc.wait(timeout=PROCESS_GROUP_KILL_GRACE_SECONDS)
+            except subprocess.TimeoutExpired:
+                pass
+    # A surviving grandchild could keep a pipe open; never block on it.
+    for t in pumps:
+        t.join(timeout=PROCESS_GROUP_KILL_GRACE_SECONDS)
+    return subprocess.CompletedProcess(args, proc.returncode, "".join(out_lines), "".join(err_lines)), timed_out
+
+
+def emit_marker(prefix: str, payload: dict) -> None:
+    """One flushed machine-readable line: PREFIX + compact JSON."""
+    print(f"{prefix}{json.dumps(payload, default=str)}", flush=True)
 
 
 def simple_log(prefix: str):
