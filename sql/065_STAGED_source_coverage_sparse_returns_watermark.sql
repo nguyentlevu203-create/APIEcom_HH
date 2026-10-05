@@ -14,6 +14,9 @@
 --   * new CTE sparse_sources: ('TIKTOK','returns') only
 --   * sparse sources skip the latest_db_date > 3 days -> STALE rule;
 --     latest_db_date stays in the output as informational event freshness
+--   * sparse source with zero events all-time: NO_DATA only without a
+--     watermark; a recent failed run with no data stays API_ERROR (064
+--     precedence); otherwise the watermark/run rules below apply
 --   * sparse source whose latest incremental run failed -> LAST_RUN_FAILED
 --     (existing value; never CURRENT without a successful poll)
 --   * sparse source with a watermark <= 24h and no PARTIAL_CATCHUP note
@@ -102,7 +105,10 @@ SELECT dm.source_system AS platform,
         WHEN dm.source_endpoint='product_inventory' AND c.latest_db_date IS NOT NULL AND (CURRENT_DATE - c.latest_db_date) <= 1 THEN 'CURRENT'
         WHEN dm.source_endpoint='product_inventory' AND c.latest_db_date IS NOT NULL THEN 'SOURCE_LAGGING'
         WHEN dm.source_endpoint='product_inventory' THEN 'NO_DATA'
-        WHEN c.latest_db_date IS NULL THEN 'NO_DATA'
+        -- P11 RECOVERY D (review fix): a sparse source with zero events
+        -- all-time is NO_DATA only when it has no watermark either; with a
+        -- watermark it falls through to the watermark/run rules below.
+        WHEN c.latest_db_date IS NULL AND (sp.source_endpoint IS NULL OR s.last_synced_at IS NULL) THEN 'NO_DATA'
         WHEN s.status IS NOT NULL AND s.status <> 'success' THEN 'LAST_RUN_FAILED'
         WHEN sp.source_endpoint IS NULL AND (CURRENT_DATE - c.latest_db_date) > 3 THEN 'STALE'
         -- P11-FIX-4: the incremental watermark must be current too, not

@@ -130,7 +130,9 @@ def pg():
 def _seed(cur, *, returns_days_ago=8, returns_watermark_hours=1, returns_last_run="success",
           orders_days_ago=0, orders_watermark_hours=1):
     """Every source: events today + fresh watermark + successful incremental,
-    except the knobs for TIKTOK returns / TIKTOK orders."""
+    except the knobs for TIKTOK returns / TIKTOK orders. A days_ago of None
+    means zero event rows all-time; a watermark of None means no
+    etl_sync_state row; a last_run of None means no incremental run row."""
     cur.execute("TRUNCATE " + ", ".join(sorted(set(DATE_TABLE.values()) | {
         "core.fact_shopee_affiliate_conversion", "control.etl_run_log", "control.etl_sync_state"})))
     cur.execute("INSERT INTO core.fact_shopee_affiliate_conversion VALUES (CURRENT_DATE)")
@@ -141,13 +143,15 @@ def _seed(cur, *, returns_days_ago=8, returns_watermark_hours=1, returns_last_ru
             days, wm_hours, last_run = returns_days_ago, returns_watermark_hours, returns_last_run
         if (system, endpoint) == ("TIKTOK", "orders"):
             days, wm_hours = orders_days_ago, orders_watermark_hours
-        if (system, endpoint) in DATE_TABLE:
+        if (system, endpoint) in DATE_TABLE and days is not None:
             cur.execute(f"INSERT INTO {DATE_TABLE[(system, endpoint)]} (channel, business_date) "
                         f"VALUES (%s, CURRENT_DATE - %s)", (system, days))
-        cur.execute("INSERT INTO control.etl_sync_state VALUES (%s,%s, now() - make_interval(hours => %s), 'success')",
-                    (system, endpoint, wm_hours))
-        cur.execute("INSERT INTO control.etl_run_log VALUES (%s,%s,'incremental',%s,NULL, now() - interval '10 minutes')",
-                    (system, endpoint, last_run))
+        if wm_hours is not None:
+            cur.execute("INSERT INTO control.etl_sync_state VALUES (%s,%s, now() - make_interval(hours => %s), 'success')",
+                        (system, endpoint, wm_hours))
+        if last_run is not None:
+            cur.execute("INSERT INTO control.etl_run_log VALUES (%s,%s,'incremental',%s,NULL, now() - interval '10 minutes')",
+                        (system, endpoint, last_run))
 
 
 def _status(cur, view):
@@ -178,7 +182,41 @@ def test_sparse_returns_recent_failed_run_is_not_current(pg):
     assert _status(pg, "cov_065")[("TIKTOK", "returns")] == "LAST_RUN_FAILED"
 
 
-@pytest.mark.parametrize("orders_days_ago,orders_watermark_hours", [(0, 1), (5, 1), (0, 30), (0, 80), (2, 1)])
+# --- zero events all-time (review fix) ---
+
+def test_a_zero_events_current_watermark_successful_run_is_current(pg):
+    _seed(pg, returns_days_ago=None, returns_watermark_hours=1, returns_last_run="success")
+    assert _status(pg, "cov_064")[("TIKTOK", "returns")] == "NO_DATA"   # the reviewed bug
+    assert _status(pg, "cov_065")[("TIKTOK", "returns")] == "CURRENT"
+    pg.execute("SELECT latest_db_date FROM mart.cov_065 WHERE platform='TIKTOK' AND source_name='returns'")
+    assert pg.fetchone()[0] is None  # still informational, still NULL
+
+
+def test_b_zero_events_no_watermark_is_no_data(pg):
+    _seed(pg, returns_days_ago=None, returns_watermark_hours=None, returns_last_run=None)
+    assert _status(pg, "cov_065")[("TIKTOK", "returns")] == "NO_DATA"
+
+
+def test_c_zero_events_failed_latest_run_is_never_current(pg):
+    _seed(pg, returns_days_ago=None, returns_watermark_hours=1, returns_last_run="fail")
+    status = _status(pg, "cov_065")[("TIKTOK", "returns")]
+    assert status == "API_ERROR"  # 064 precedence: recent failed run with zero data
+    _seed(pg, returns_days_ago=None, returns_watermark_hours=1, returns_last_run="success")
+    pg.execute("INSERT INTO control.etl_run_log VALUES ('TIKTOK','returns','incremental','fail',NULL, now() - interval '4 days')")
+    pg.execute("UPDATE control.etl_run_log SET started_at = now() - interval '5 days' "
+               "WHERE source_system='TIKTOK' AND source_endpoint='returns' AND status='success'")
+    assert _status(pg, "cov_065")[("TIKTOK", "returns")] == "LAST_RUN_FAILED"  # older than recent_run's 3 days
+
+
+def test_d_zero_events_watermark_over_72h_is_stale(pg):
+    _seed(pg, returns_days_ago=None, returns_watermark_hours=80)
+    assert _status(pg, "cov_065")[("TIKTOK", "returns")] == "STALE"
+    _seed(pg, returns_days_ago=None, returns_watermark_hours=30)
+    assert _status(pg, "cov_065")[("TIKTOK", "returns")] == "SOURCE_LAGGING"
+
+
+@pytest.mark.parametrize("orders_days_ago,orders_watermark_hours", [
+    (0, 1), (5, 1), (0, 30), (0, 80), (2, 1), (None, 1), (None, None), (0, None)])
 def test_dense_sources_identical_to_064(pg, orders_days_ago, orders_watermark_hours):
     _seed(pg, returns_days_ago=0, orders_days_ago=orders_days_ago, orders_watermark_hours=orders_watermark_hours)
     old, new = _status(pg, "cov_064"), _status(pg, "cov_065")
@@ -186,3 +224,5 @@ def test_dense_sources_identical_to_064(pg, orders_days_ago, orders_watermark_ho
            {k: v for k, v in old.items() if k != ("TIKTOK", "returns")}
     if orders_days_ago == 5:
         assert new[("TIKTOK", "orders")] == "STALE"  # dense date rule still applies
+    if orders_days_ago is None:
+        assert new[("TIKTOK", "orders")] == "NO_DATA"  # dense zero-event rule unchanged, watermark or not
