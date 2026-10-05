@@ -15,15 +15,22 @@ $RUNNER_TEMP, removed `if: always()`), written atomically. GitHub Actions
 only: on the local Mac nothing here is ever read or written, Keychain
 behavior is unchanged. Never logs token values.
 
-Read contract: a missing or invalid file (unparseable, not an object, any
-required field empty) is ignored and the caller falls back to the env
-bundle, exactly as before this module existed. A configured directory
-that is inside the repository is refused (read: ignored, write: raises).
+Read contract (P11 RECOVERY D2):
+  * file ABSENT -> None, caller falls back to the env bundle (first
+    worker of the job, nothing refreshed yet);
+  * file PRESENT but unreadable, unparseable, not an object, any required
+    field empty, not owned by this user, or group/other-accessible ->
+    RuntimeTokenStateError (fail closed: never silently fall back to the
+    stale job-start env bundle, which may hold an already-rotated token);
+  * HH_TOKEN_STATE_DIR set on GitHub Actions but relative or inside the
+    repository -> RuntimeTokenStateError on read and write.
+Error messages carry bundle names and error classes only, never values.
 """
 from __future__ import annotations
 
 import json
 import os
+import stat
 import tempfile
 from pathlib import Path
 from typing import Optional
@@ -48,11 +55,9 @@ def _state_dir() -> Optional[Path]:
     if not raw:
         return None
     path = Path(raw)
-    if not path.is_absolute():
-        return None
-    resolved = path.resolve()
-    if resolved == REPO_ROOT or REPO_ROOT in resolved.parents:
-        return None
+    resolved = path.resolve() if path.is_absolute() else None
+    if resolved is None or resolved == REPO_ROOT or REPO_ROOT in resolved.parents:
+        raise RuntimeTokenStateError(f"{STATE_DIR_ENV} must be an absolute path outside the repository")
     return resolved
 
 
@@ -67,14 +72,21 @@ def is_enabled() -> bool:
 
 def read_state(bundle_name: str) -> Optional[dict]:
     path = _state_path(bundle_name)
-    if path is None or not path.exists():
+    if path is None or not os.path.lexists(path):
         return None
     try:
+        st = os.lstat(path)
+        if not stat.S_ISREG(st.st_mode):
+            raise RuntimeTokenStateError(f"runner-local token state for {bundle_name} is not a regular file")
+        if st.st_uid != os.getuid() or stat.S_IMODE(st.st_mode) & 0o077:
+            raise RuntimeTokenStateError(f"runner-local token state for {bundle_name} has unsafe ownership/permissions")
         parsed = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, ValueError, TypeError):
-        return None
+    except RuntimeTokenStateError:
+        raise
+    except (OSError, ValueError, TypeError) as exc:
+        raise RuntimeTokenStateError(f"runner-local token state for {bundle_name} is unreadable ({type(exc).__name__})") from None
     if not isinstance(parsed, dict) or any(not parsed.get(k) for k in REQUIRED_KEYS):
-        return None
+        raise RuntimeTokenStateError(f"runner-local token state for {bundle_name} failed schema validation")
     return parsed
 
 
@@ -82,8 +94,6 @@ def write_state(bundle_name: str, state_json: str) -> bool:
     """Atomically replace the runner-local bundle (0600). Returns False when
     not enabled (local Mac, or no directory configured); raises
     RuntimeTokenStateError if enabled but the write fails."""
-    if _running_in_github_actions() and os.environ.get(STATE_DIR_ENV) and _state_dir() is None:
-        raise RuntimeTokenStateError(f"{STATE_DIR_ENV} must be an absolute path outside the repository")
     path = _state_path(bundle_name)
     if path is None:
         return False

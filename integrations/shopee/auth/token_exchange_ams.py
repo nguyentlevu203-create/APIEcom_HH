@@ -167,13 +167,21 @@ def persist_ams_rotating_state(
         }
     )
     os.environ["SHOPEE_AMS_TOKEN_STATE_JSON"] = state_json
+    # P11 RECOVERY D2 — the GitHub Secret (durable, next run) is ALWAYS
+    # attempted first; the runner-local file (intra-run propagation to
+    # later worker subprocesses) can never prevent it. Either failing is
+    # a hard failure, reported after both have been attempted.
+    ok = put_secret_with_retry("SHOPEE_AMS_TOKEN_STATE_JSON", state_json, repo, writer_token)
+    local_error = None
     try:
         write_runtime_state("SHOPEE_AMS_TOKEN_STATE_JSON", state_json)
     except RuntimeTokenStateError as exc:
-        del state_json
-        raise CredentialPersistenceCriticalFailure(str(exc)) from None
-    ok = put_secret_with_retry("SHOPEE_AMS_TOKEN_STATE_JSON", state_json, repo, writer_token)
+        local_error = str(exc)
     del state_json
+    if local_error is not None:
+        raise CredentialPersistenceCriticalFailure(
+            f"{local_error} (GitHub Secret SHOPEE_AMS_TOKEN_STATE_JSON write {'succeeded' if ok else 'FAILED'})"
+        )
     if not ok:
         raise CredentialPersistenceCriticalFailure(
             "durable persistence of rotated Shopee AMS token state to "

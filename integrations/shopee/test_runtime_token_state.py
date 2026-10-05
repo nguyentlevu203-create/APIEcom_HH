@@ -121,10 +121,35 @@ def test_without_local_state_stale_env_bundle_still_triggers_refresh(github, mon
     assert refreshes == [1]  # the pre-fix behavior, now only for the first worker
 
 
-@pytest.mark.parametrize("content", ["not json", "[1, 2]", json.dumps({**OLD, "refresh_token": ""})])
-def test_invalid_local_file_is_ignored_and_env_bundle_used(github, content):
-    (github / "SHOPEE_TOKEN_STATE_JSON.json").write_text(content)
+def test_missing_local_file_falls_back_to_env_bundle(github):
+    assert not (github / "SHOPEE_TOKEN_STATE_JSON.json").exists()
     assert keychain.get_secret(keychain.ACCOUNT_ACCESS_TOKEN) == OLD["access_token"]
+
+
+@pytest.mark.parametrize("content", ["not json", "[1, 2]", json.dumps({**OLD, "refresh_token": ""})])
+def test_present_malformed_local_file_fails_closed(github, content):
+    path = github / "SHOPEE_TOKEN_STATE_JSON.json"
+    path.write_text(content)
+    path.chmod(0o600)
+    with pytest.raises(rts.RuntimeTokenStateError) as exc:
+        keychain.get_secret(keychain.ACCOUNT_ACCESS_TOKEN)
+    _no_fakes(str(exc.value))
+
+
+def test_present_local_file_with_unsafe_permissions_fails_closed(github):
+    path = github / "SHOPEE_TOKEN_STATE_JSON.json"
+    path.write_text(json.dumps({**OLD, "access_token": NEW_ACCESS}))
+    path.chmod(0o644)
+    with pytest.raises(rts.RuntimeTokenStateError, match="permissions"):
+        keychain.get_secret(keychain.ACCOUNT_ACCESS_TOKEN)
+
+
+def test_present_local_symlink_fails_closed(github, tmp_path):
+    target = tmp_path / "elsewhere.json"
+    target.write_text(json.dumps(OLD))
+    (github / "SHOPEE_TOKEN_STATE_JSON.json").symlink_to(target)
+    with pytest.raises(rts.RuntimeTokenStateError, match="regular file"):
+        keychain.get_secret(keychain.ACCOUNT_ACCESS_TOKEN)
 
 
 def test_github_secret_failure_is_still_hard_failure(github, writer):
@@ -132,9 +157,10 @@ def test_github_secret_failure_is_still_hard_failure(github, writer):
     with pytest.raises(keychain.CredentialPersistenceCriticalFailure) as exc:
         keychain.persist_rotating_state(NEW_ACCESS, NEW_REFRESH, _future(), "4900000001")
     _no_fakes(str(exc.value))
+    assert len(writer.calls) == 1
 
 
-def test_local_state_write_failure_is_hard_failure(github, writer, monkeypatch):
+def test_local_state_write_failure_still_attempts_github_secret_then_fails(github, writer, monkeypatch):
     github.chmod(0o500)  # directory not writable
     try:
         with pytest.raises(keychain.CredentialPersistenceCriticalFailure) as exc:
@@ -142,14 +168,29 @@ def test_local_state_write_failure_is_hard_failure(github, writer, monkeypatch):
     finally:
         github.chmod(0o700)
     _no_fakes(str(exc.value))
-    assert writer.calls == []  # never claims durability it does not have
+    assert "succeeded" in str(exc.value)
+    assert writer.calls == [("SHOPEE_TOKEN_STATE_JSON", {
+        "access_token": NEW_ACCESS, "refresh_token": NEW_REFRESH,
+        "access_token_expire_at": writer.calls[0][1]["access_token_expire_at"], "refresh_token_expire_at": "4900000001"})]
+
+
+def test_secret_attempted_before_local_file(github, writer, monkeypatch):
+    order = []
+    import github_secrets_writer
+    monkeypatch.setattr(github_secrets_writer, "put_secret_with_retry", lambda *a, **k: order.append("secret") or True)
+    real_write = keychain.write_runtime_state
+    monkeypatch.setattr(keychain, "write_runtime_state", lambda *a: order.append("local") or real_write(*a))
+    keychain.persist_rotating_state(NEW_ACCESS, NEW_REFRESH, _future(), "4900000001")
+    assert order == ["secret", "local"]
 
 
 def test_state_dir_inside_repo_is_refused(github, writer, monkeypatch):
     monkeypatch.setenv(rts.STATE_DIR_ENV, str(SHOPEE_DIR / "should-not-exist"))
-    assert rts.read_state("SHOPEE_TOKEN_STATE_JSON") is None
+    with pytest.raises(rts.RuntimeTokenStateError, match="outside the repository"):
+        rts.read_state("SHOPEE_TOKEN_STATE_JSON")
     with pytest.raises(keychain.CredentialPersistenceCriticalFailure, match="outside the repository"):
         keychain.persist_rotating_state(NEW_ACCESS, NEW_REFRESH, _future(), "4900000001")
+    assert len(writer.calls) == 1  # durable secret still attempted
     assert not (SHOPEE_DIR / "should-not-exist").exists()
 
 
@@ -179,6 +220,24 @@ def test_ams_github_secret_failure_is_hard_failure(github, writer):
     writer.ok = False
     with pytest.raises(keychain.CredentialPersistenceCriticalFailure):
         ams.persist_ams_rotating_state(NEW_ACCESS, NEW_REFRESH, _future(), "4900000001")
+
+
+def test_ams_local_write_failure_still_attempts_github_secret(github, writer):
+    github.chmod(0o500)
+    try:
+        with pytest.raises(keychain.CredentialPersistenceCriticalFailure):
+            ams.persist_ams_rotating_state(NEW_ACCESS, NEW_REFRESH, _future(), "4900000001")
+    finally:
+        github.chmod(0o700)
+    assert [c[0] for c in writer.calls] == ["SHOPEE_AMS_TOKEN_STATE_JSON"]
+
+
+def test_ams_present_malformed_local_file_fails_closed(github):
+    path = github / "SHOPEE_AMS_TOKEN_STATE_JSON.json"
+    path.write_text("{}")
+    path.chmod(0o600)
+    with pytest.raises(rts.RuntimeTokenStateError):
+        ams.get_secret(ams.ACCOUNT_AMS_ACCESS_TOKEN)
 
 
 # --- real child processes ------------------------------------------------------
