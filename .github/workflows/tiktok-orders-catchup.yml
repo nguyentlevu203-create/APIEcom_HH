@@ -1,0 +1,83 @@
+# P11 RECOVERY B — dedicated TikTok/orders catch-up (MANUAL ONLY).
+#
+# Advances ONLY control.etl_sync_state(TIKTOK, orders) via
+# scripts/run_tiktok_orders_catchup.py, which repeats the production
+# incremental worker's bounded, per-chunk-committed passes. No Shopee,
+# no other TikTok domain, no GOLD, no reconciliation, no healthcheck.
+#
+# Never add a `schedule:` trigger here — catch-up is a deliberate,
+# human-dispatched recovery step. Normal ingestion stays in
+# p3-incremental.yml, whose verdict still treats
+# PARTIAL_CATCHUP:TIKTOK/orders as RED.
+#
+# Shares p3-incremental.yml's concurrency group so this job and a
+# production cycle can never write the same database at the same time.
+
+name: TikTok Orders Catch-up (manual only)
+
+on:
+  workflow_dispatch:
+    inputs:
+      budget_minutes:
+        description: "Job time budget in minutes (16-180). A new pass only starts if a full 900s pass still fits."
+        required: false
+        default: "90"
+
+concurrency:
+  group: p3-incremental-production-cycle
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  tiktok-orders-catchup:
+    runs-on: ubuntu-latest
+    # Max budget 180 min + setup/teardown headroom.
+    timeout-minutes: 200
+    env:
+      TZ: UTC
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install -r integrations/tiktok_shop/requirements.txt
+          pip install psycopg2-binary keyring requests pynacl
+
+      - name: Provision TikTok tokens (from secrets, never committed)
+        run: |
+          umask 077
+          printf '%s' "$TIKTOK_TOKENS_JSON" > integrations/tiktok_shop/tokens.json
+          printf '%s' "$TIKTOK_SHOP_INFO_JSON" > integrations/tiktok_shop/shop_info.json
+          chmod 600 integrations/tiktok_shop/tokens.json integrations/tiktok_shop/shop_info.json
+        env:
+          TIKTOK_TOKENS_JSON: ${{ secrets.TIKTOK_TOKENS_JSON }}
+          TIKTOK_SHOP_INFO_JSON: ${{ secrets.TIKTOK_SHOP_INFO_JSON }}
+
+      - name: Run TikTok orders catch-up
+        run: python3 scripts/run_tiktok_orders_catchup.py --budget-minutes "$BUDGET_MINUTES"
+        env:
+          BUDGET_MINUTES: ${{ inputs.budget_minutes }}
+          HH_ETL_WRITER_DATABASE_URL: ${{ secrets.HH_ETL_WRITER_DATABASE_URL }}
+          TIKTOK_APP_SECRET: ${{ secrets.TIKTOK_APP_SECRET }}
+          # Used only by token_persistence.py to write a refreshed bundle
+          # back to TIKTOK_TOKENS_JSON (fails TOKEN_STATE_PERSISTENCE_FAILED).
+          GH_SECRETS_WRITER_TOKEN: ${{ secrets.GH_SECRETS_WRITER_TOKEN }}
+
+      - name: Clean up provisioned token files
+        if: always()
+        run: rm -f integrations/tiktok_shop/tokens.json integrations/tiktok_shop/shop_info.json
+
+      - name: Upload catch-up log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tiktok-orders-catchup-${{ github.run_id }}
+          path: artifacts/v0/catchup_logs/
+          retention-days: 14
+          if-no-files-found: warn
