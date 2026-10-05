@@ -24,6 +24,7 @@ from typing import Any
 from config import APP_KEY, REQUESTED_P0_SCOPES, SHOP_EXPECTED_REGION
 from keychain import get_app_secret_or_prompt
 from tiktok_client import TikTokAPIError, TikTokShopClient, mask
+from token_persistence import persist_refreshed_bundle
 from token_store import (
     access_token_needs_refresh,
     load_tokens,
@@ -43,6 +44,10 @@ def do_refresh(app_key: str, app_secret: str, refresh_token_value: str) -> dict[
     merged.update(data)
     merged["app_key"] = app_key
     save_tokens(merged)
+    # On a GitHub runner tokens.json is deleted at job end — persist the
+    # same full bundle to TIKTOK_TOKENS_JSON or fail with
+    # TOKEN_STATE_PERSISTENCE_FAILED. No-op on the local Mac.
+    persist_refreshed_bundle(load_tokens())
     return merged
 
 

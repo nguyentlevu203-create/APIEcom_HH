@@ -347,6 +347,19 @@ def compute_cycle_verdict(ingestion: dict, gold_steps: list, recon: dict, health
     for domain in ingestion.get("ingestion_partial_catchup_domains", []):
         reasons.append(f"INGESTION_DOMAIN_PARTIAL_CATCHUP:{domain}")
 
+    # P11 RECOVERY A — a refreshed TikTok token that never reached the
+    # GitHub Secret strands the next run; name it explicitly, whichever
+    # stage (ingestion or reconciliation) hit the refresh.
+    token_persist_failed = any(
+        r.get("error_class") == ic.TOKEN_STATE_PERSISTENCE_FAILED
+        for r in (ingestion.get("ingestion_domain_results") or {}).values()
+    ) or any(
+        t.get("error_class") == ic.TOKEN_STATE_PERSISTENCE_FAILED
+        for t in recon.get("reconciliation_domain_timings") or []
+    )
+    if token_persist_failed:
+        reasons.append(ic.TOKEN_STATE_PERSISTENCE_FAILED)
+
     for step in gold_steps:
         if step["status"] != "SUCCESS":
             reasons.append(f"GOLD_STEP_FAILURE:{step['label']}")

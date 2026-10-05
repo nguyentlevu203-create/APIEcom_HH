@@ -281,6 +281,13 @@ def is_domain_ok(status: Optional[str]) -> bool:
     return status in REQUIRED_OK_STATUSES
 
 
+# P11 RECOVERY A — a TikTok refresh succeeded but the new bundle could
+# not be written back to the TIKTOK_TOKENS_JSON GitHub Secret (see
+# integrations/tiktok_shop/token_persistence.py). Same literal as its
+# FAILURE_CODE; promoted by name in the cycle verdict.
+TOKEN_STATE_PERSISTENCE_FAILED = "TOKEN_STATE_PERSISTENCE_FAILED"
+
+
 def classify_domain_error(domain_result: dict) -> Optional[str]:
     """Best-effort error_class for observability/logging only. Never
     feeds back into the PASS/FAIL decision — that's is_domain_ok() alone,
@@ -291,6 +298,8 @@ def classify_domain_error(domain_result: dict) -> Optional[str]:
     if domain_result.get("status") == PARTIAL_CATCHUP_STATUS:
         return PARTIAL_CATCHUP_STATUS
     error = str(domain_result.get("error") or "")
+    if TOKEN_STATE_PERSISTENCE_FAILED in error:
+        return TOKEN_STATE_PERSISTENCE_FAILED
     if "DOMAIN_WORKER_TIMEOUT" in error:
         return "DOMAIN_WORKER_TIMEOUT"
     if "429" in error:
