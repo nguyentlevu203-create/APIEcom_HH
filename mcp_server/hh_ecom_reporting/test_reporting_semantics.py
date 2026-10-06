@@ -38,3 +38,9 @@ def test_reference_has_no_local_ready_for_any_non_null_cost():
     src = (HERE / "query_service.py").read_text()
     assert "def _cost_status(" not in src and " _cost_status(" not in src
     assert '"READY" if r["total_cogs"] is not None' not in src
+
+
+def test_reference_cogs_status_aggregation_is_not_text_max():
+    src = (HERE / "query_service.py").read_text()
+    assert "max(availability_status)" not in src
+    assert "bool_or(availability_status = 'COGS_INCOMPLETE')" in src

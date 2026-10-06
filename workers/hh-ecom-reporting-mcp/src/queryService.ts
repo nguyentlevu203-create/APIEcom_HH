@@ -127,8 +127,13 @@ export async function getEcomOverview(
     // COGS components (the flag that already drives gm1 = COGS_INCOMPLETE);
     // reused here, never re-derived.
     "LEFT JOIN (SELECT business_date, channel, " +
-    "max(availability_status) FILTER (WHERE metric_name = 'sellable_cogs') AS sellable_cogs_status, " +
-    "max(availability_status) FILTER (WHERE metric_name = 'promo_gift_cost') AS promo_gift_cost_status " +
+    // any COGS_INCOMPLETE row wins; READY only when every row is READY (never max() on text).
+    "CASE WHEN bool_and(availability_status = 'READY') FILTER (WHERE metric_name = 'sellable_cogs') THEN 'READY' " +
+    "WHEN bool_or(availability_status = 'COGS_INCOMPLETE') FILTER (WHERE metric_name = 'sellable_cogs') THEN 'COGS_INCOMPLETE' " +
+    "ELSE min(availability_status) FILTER (WHERE metric_name = 'sellable_cogs') END AS sellable_cogs_status, " +
+    "CASE WHEN bool_and(availability_status = 'READY') FILTER (WHERE metric_name = 'promo_gift_cost') THEN 'READY' " +
+    "WHEN bool_or(availability_status = 'COGS_INCOMPLETE') FILTER (WHERE metric_name = 'promo_gift_cost') THEN 'COGS_INCOMPLETE' " +
+    "ELSE min(availability_status) FILTER (WHERE metric_name = 'promo_gift_cost') END AS promo_gift_cost_status " +
     "FROM mart.v_ai_metric_status WHERE metric_name IN ('sellable_cogs', 'promo_gift_cost') " +
     "AND business_date BETWEEN $1 AND $2 GROUP BY 1,2) cs ON cs.business_date = g.business_date AND cs.channel = g.channel " +
     "WHERE g.business_date BETWEEN $1 AND $2";

@@ -43,6 +43,9 @@
      "status": "PARTIAL_PERIOD_COVERAGE", "source_freshness_status": "SOURCE_LAGGING"},
     {"in": {"fromDate": "2026-10-06", "toDate": "2026-10-06", "rowCount": 0, "latestAvailableDate": null,
             "coverage": {"coverage_status": "NO_PERMISSION", "watermark_date": null, "watermark_at": null}},
-     "status": "NO_PERMISSION", "source_freshness_status": "NO_PERMISSION"}
+     "status": "NO_PERMISSION", "source_freshness_status": "NO_PERMISSION"},
+    {"in": {"fromDate": "2026-10-06", "toDate": "2026-10-06", "rowCount": 0, "latestAvailableDate": null,
+            "coverage": {"coverage_status": "NO_DATA", "watermark_date": null, "watermark_at": null}},
+     "status": "MISSING_SOURCE", "source_freshness_status": "NO_DATA"}
   ]
 }

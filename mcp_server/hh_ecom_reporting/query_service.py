@@ -273,8 +273,13 @@ def get_ecom_overview(from_date: str, to_date: str, platform: Optional[str] = No
         # P14-B D3 — COGS completeness is Gold's own coverage_status for the two
         # COGS components (the flag behind gm1 = COGS_INCOMPLETE); reused, not re-derived.
         "LEFT JOIN (SELECT business_date AS cs_date, channel AS cs_channel, "
-        "max(availability_status) FILTER (WHERE metric_name = 'sellable_cogs') AS sellable_cogs_status, "
-        "max(availability_status) FILTER (WHERE metric_name = 'promo_gift_cost') AS promo_gift_cost_status "
+        # any COGS_INCOMPLETE row wins; READY only when every row is READY (never max() on text).
+        "CASE WHEN bool_and(availability_status = 'READY') FILTER (WHERE metric_name = 'sellable_cogs') THEN 'READY' "
+        "WHEN bool_or(availability_status = 'COGS_INCOMPLETE') FILTER (WHERE metric_name = 'sellable_cogs') THEN 'COGS_INCOMPLETE' "
+        "ELSE min(availability_status) FILTER (WHERE metric_name = 'sellable_cogs') END AS sellable_cogs_status, "
+        "CASE WHEN bool_and(availability_status = 'READY') FILTER (WHERE metric_name = 'promo_gift_cost') THEN 'READY' "
+        "WHEN bool_or(availability_status = 'COGS_INCOMPLETE') FILTER (WHERE metric_name = 'promo_gift_cost') THEN 'COGS_INCOMPLETE' "
+        "ELSE min(availability_status) FILTER (WHERE metric_name = 'promo_gift_cost') END AS promo_gift_cost_status "
         "FROM mart.v_ai_metric_status WHERE metric_name IN ('sellable_cogs', 'promo_gift_cost') "
         "GROUP BY 1, 2) cs ON cs.cs_date = g.business_date AND cs.cs_channel = g.channel "
         "WHERE business_date BETWEEN %s AND %s"

@@ -199,8 +199,12 @@ export function freshnessEnvelope(f: FreshnessInput): Row {
   }
   // A CURRENT source whose poll already reached into the period: partly known.
   // One whose poll has not reached the period yet (e.g. AMS T-2 latency): lagging.
+  // mart.v_ai_source_coverage NO_DATA means "nothing ever loaded" — reported as
+  // MISSING_SOURCE here, because this envelope's NO_DATA means "covered, no events".
   const pollInPeriod = f.coverage.watermark_date !== null && f.coverage.watermark_date >= f.fromDate;
-  return { ...freshness, status: cs !== "CURRENT" ? cs : pollInPeriod ? "PARTIAL_PERIOD_COVERAGE" : "SOURCE_LAGGING",
+  const status = cs === "CURRENT" ? (pollInPeriod ? "PARTIAL_PERIOD_COVERAGE" : "SOURCE_LAGGING")
+    : cs === "NO_DATA" ? "MISSING_SOURCE" : cs;
+  return { ...freshness, status,
     blocking_reason: `Source data available only through ${latest ?? "never"} (source status ${cs}). ` +
       "An empty result for this period is NOT zero activity." };
 }

@@ -55,3 +55,8 @@ test("audit log carries metadata only, never connection string/token/payload", (
   }
   assert.match(db, /No further detail is exposed/);
 });
+
+test("COGS status aggregation never uses max() on text (would rank READY above COGS_INCOMPLETE)", () => {
+  assert.doesNotMatch(qs, /max\(availability_status\)/);
+  assert.match(qs, /bool_or\(availability_status = 'COGS_INCOMPLETE'\) FILTER \(WHERE metric_name = 'sellable_cogs'\)/);
+});

@@ -95,7 +95,12 @@ def freshness_envelope(from_date: str, to_date: str, row_count: int, latest_avai
                 f"Source is CURRENT and was polled past the period end ({coverage.get('watermark_at')}); "
                 "no events in this period."}
     poll_in_period = wm_date is not None and wm_date >= from_date
-    status = cs if cs != "CURRENT" else ("PARTIAL_PERIOD_COVERAGE" if poll_in_period else "SOURCE_LAGGING")
+    # mart.v_ai_source_coverage NO_DATA means "nothing ever loaded" — reported as
+    # MISSING_SOURCE here, because this envelope's NO_DATA means "covered, no events".
+    if cs == "CURRENT":
+        status = "PARTIAL_PERIOD_COVERAGE" if poll_in_period else "SOURCE_LAGGING"
+    else:
+        status = "MISSING_SOURCE" if cs == "NO_DATA" else cs
     return {**fresh, "status": status,
             "blocking_reason": f"Source data available only through {latest or 'never'} (source status {cs}). "
                                "An empty result for this period is NOT zero activity."}
