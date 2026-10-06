@@ -1,0 +1,48 @@
+{
+  "_note": "P14-B shared cases: the Worker (semantics.ts) and the Python reference (reporting_semantics.py) must give identical results.",
+  "cost_line": [
+    {"args": ["TIKTOK", "payment_fee", 0, "SOURCE_LAGGING"], "amount": null, "status": "SOURCE_LAGGING"},
+    {"args": ["TIKTOK", "fixed_fee", null, "NOT_SETTLED_YET"], "amount": null, "status": "NOT_SETTLED_YET"},
+    {"args": ["TIKTOK", "infrastructure_fee", 0, "COMPLETE_SETTLEMENT_COVERAGE"], "amount": 0, "status": "READY"},
+    {"args": ["TIKTOK", "fixed_fee", 1341230, "COMPLETE_SETTLEMENT_COVERAGE"], "amount": 1341230, "status": "READY"},
+    {"args": ["TIKTOK", "vxp_fee", 42, "PARTIAL_SETTLEMENT_COVERAGE"], "amount": 42, "status": "PARTIAL_SETTLEMENT_COVERAGE"},
+    {"args": ["TIKTOK", "affiliate_fee", 7, null], "amount": 7, "status": "SETTLEMENT_COVERAGE_UNKNOWN"},
+    {"args": ["TIKTOK", "hh_internal_packaging_cost", 0, "SOURCE_LAGGING"], "amount": 0, "status": "READY"},
+    {"args": ["TIKTOK", "ads_spend", null, "SOURCE_LAGGING"], "amount": null, "status": "SEPARATE_API_REQUIRED"},
+    {"args": ["SHOPEE", "fixed_fee", 806405, "READY"], "amount": 806405, "status": "READY"},
+    {"args": ["SHOPEE", "vxp_fee", null, "READY"], "amount": null, "status": "MISSING_SOURCE"}
+  ],
+  "cogs": [
+    {"args": [880767.38, 880767.38, 0, "COGS_INCOMPLETE", "COGS_INCOMPLETE"], "value": 880767.38, "status": "COGS_INCOMPLETE"},
+    {"args": [100, 100, 0, "READY", "COGS_INCOMPLETE"], "value": 100, "status": "COGS_INCOMPLETE"},
+    {"args": [100, 90, 10, "READY", "READY"], "value": 100, "status": "READY"},
+    {"args": [0, null, null, null, null], "value": null, "status": "MISSING_SOURCE"}
+  ],
+  "freshness": [
+    {"in": {"fromDate": "2026-10-06", "toDate": "2026-10-06", "rowCount": 0, "latestAvailableDate": "2026-09-12", "coverage": null},
+     "status": "SOURCE_LAGGING", "source_freshness_status": "MISSING_SOURCE"},
+    {"in": {"fromDate": "2026-09-10", "toDate": "2026-09-10", "rowCount": 2, "latestAvailableDate": "2026-09-12", "coverage": null},
+     "status": "READY", "source_freshness_status": "MISSING_SOURCE"},
+    {"in": {"fromDate": "2026-10-05", "toDate": "2026-10-05", "rowCount": 0, "latestAvailableDate": "2026-10-03",
+            "coverage": {"coverage_status": "CURRENT", "watermark_date": "2026-10-06", "watermark_at": "w"}},
+     "status": "NO_DATA", "source_freshness_status": "CURRENT"},
+    {"in": {"fromDate": "2026-10-06", "toDate": "2026-10-06", "rowCount": 0, "latestAvailableDate": "2026-10-05",
+            "coverage": {"coverage_status": "CURRENT", "watermark_date": "2026-10-06", "watermark_at": "w"}},
+     "status": "PARTIAL_PERIOD_COVERAGE", "source_freshness_status": "CURRENT"},
+    {"in": {"fromDate": "2026-10-06", "toDate": "2026-10-06", "rowCount": 0, "latestAvailableDate": "2026-10-04",
+            "coverage": {"coverage_status": "CURRENT", "watermark_date": "2026-10-04", "watermark_at": "w"}},
+     "status": "SOURCE_LAGGING", "source_freshness_status": "CURRENT"},
+    {"in": {"fromDate": "2026-10-06", "toDate": "2026-10-06", "rowCount": 0, "latestAvailableDate": "2026-10-04",
+            "coverage": {"coverage_status": "SOURCE_LAGGING", "watermark_date": "2026-10-06", "watermark_at": "w"}},
+     "status": "SOURCE_LAGGING", "source_freshness_status": "SOURCE_LAGGING"},
+    {"in": {"fromDate": "2026-09-30", "toDate": "2026-09-30", "rowCount": 0, "latestAvailableDate": "2026-10-04",
+            "coverage": {"coverage_status": "SOURCE_LAGGING", "watermark_date": "2026-10-06", "watermark_at": "w"}},
+     "status": "NO_DATA", "source_freshness_status": "SOURCE_LAGGING"},
+    {"in": {"fromDate": "2026-10-01", "toDate": "2026-10-06", "rowCount": 12, "latestAvailableDate": "2026-10-04",
+            "coverage": {"coverage_status": "SOURCE_LAGGING", "watermark_date": "2026-10-06", "watermark_at": "w"}},
+     "status": "PARTIAL_PERIOD_COVERAGE", "source_freshness_status": "SOURCE_LAGGING"},
+    {"in": {"fromDate": "2026-10-06", "toDate": "2026-10-06", "rowCount": 0, "latestAvailableDate": null,
+            "coverage": {"coverage_status": "NO_PERMISSION", "watermark_date": null, "watermark_at": null}},
+     "status": "NO_PERMISSION", "source_freshness_status": "NO_PERMISSION"}
+  ]
+}

@@ -28,6 +28,8 @@ from typing import Any, Optional
 import psycopg2
 import psycopg2.extras
 
+from reporting_semantics import cogs_envelope, cost_line, freshness_envelope
+
 try:
     import keyring
 except ImportError:  # pragma: no cover - keyring is macOS-local-dev only
@@ -196,15 +198,6 @@ def _run(tool_name: str, sql: str, params: tuple, params_safe: dict) -> list[dic
 # shared cost/status envelope helpers — reused, not reimplemented per tool
 # ---------------------------------------------------------------------------
 
-# Static classification for cost lines that are structurally never expected
-# to be populated yet (per P7.2's locked CM2 contract) — used only to give
-# ChatGPT an honest status, never to fabricate a value.
-_KNOWN_MISSING_COST_STATUS = {
-    "ads_spend": "SEPARATE_API_REQUIRED",
-    "booking_kol_koc": "MISSING_SOURCE",
-    "live_inhouse_cost": "MISSING_SOURCE",
-}
-
 _COST_LINE_LABELS = [
     ("fixed_fee", "platform_fixed_fee"),
     ("service_fee", "platform_service_fee"),
@@ -222,12 +215,6 @@ _COST_LINE_LABELS = [
 ]
 
 
-def _cost_status(column: str, value) -> str:
-    if value is not None:
-        return "READY"
-    return _KNOWN_MISSING_COST_STATUS.get(column, "MISSING_SOURCE")
-
-
 def _cm2_missing_sources(row: dict) -> list[str]:
     missing = []
     if row.get("ads_spend") is None:
@@ -241,6 +228,30 @@ def _cm2_missing_sources(row: dict) -> list[str]:
     return missing
 
 
+def _fetch_freshness(tool_name: str, latest_sql: str, latest_params: tuple,
+                     domain: Optional[tuple]) -> tuple:
+    """P14-B D4 — one fixed query: the view's latest loaded date plus that
+    source's mart.v_ai_source_coverage row (watermark in ICT). domain=None
+    means no incremental ingestion domain feeds the view."""
+    if domain is None:
+        rows = _run(tool_name, f"SELECT ({latest_sql}) AS latest_available_date", latest_params, {})
+        return (rows[0]["latest_available_date"] if rows else None), None
+    rows = _run(
+        tool_name,
+        f"SELECT ({latest_sql}) AS latest_available_date, c.coverage_status, "
+        "to_char(c.last_success_at AT TIME ZONE 'Asia/Ho_Chi_Minh', 'YYYY-MM-DD\"T\"HH24:MI:SS\"+07:00\"') AS watermark_at, "
+        "to_char((c.last_success_at AT TIME ZONE 'Asia/Ho_Chi_Minh')::date, 'YYYY-MM-DD') AS watermark_date "
+        "FROM (SELECT 1) one LEFT JOIN mart.v_ai_source_coverage c ON c.platform = %s AND c.source_name = %s",
+        latest_params + domain, {},
+    )
+    r = rows[0] if rows else {}
+    return r.get("latest_available_date"), {
+        "coverage_status": r.get("coverage_status"),
+        "watermark_date": r.get("watermark_date"),
+        "watermark_at": r.get("watermark_at"),
+    }
+
+
 # ---------------------------------------------------------------------------
 # TOOL 1 — get_ecom_overview
 # ---------------------------------------------------------------------------
@@ -252,12 +263,21 @@ def get_ecom_overview(from_date: str, to_date: str, platform: Optional[str] = No
     sql = (
         "SELECT business_date, channel, orders, units, platform_gmv, "
         "net_sales, net_sales_status, net_sales_basis, "
-        "total_cogs, gm1, gm1_margin, gm1_status, "
+        "total_cogs, sellable_cogs, promo_gift_cost, cs.sellable_cogs_status, cs.promo_gift_cost_status, "
+        "gm1, gm1_margin, gm1_status, "
         "cm1, cm1_margin, cm1_status, "
         "cm2, cm2_margin, cm2_status, "
         "ads_spend, booking_kol_koc, live_inhouse_cost, backoffice_cost, "
         "profit, profit_margin, profit_status, data_freshness_status "
-        "FROM mart.v_ceo_ecom_daily WHERE business_date BETWEEN %s AND %s"
+        "FROM mart.v_ceo_ecom_daily g "
+        # P14-B D3 — COGS completeness is Gold's own coverage_status for the two
+        # COGS components (the flag behind gm1 = COGS_INCOMPLETE); reused, not re-derived.
+        "LEFT JOIN (SELECT business_date AS cs_date, channel AS cs_channel, "
+        "max(availability_status) FILTER (WHERE metric_name = 'sellable_cogs') AS sellable_cogs_status, "
+        "max(availability_status) FILTER (WHERE metric_name = 'promo_gift_cost') AS promo_gift_cost_status "
+        "FROM mart.v_ai_metric_status WHERE metric_name IN ('sellable_cogs', 'promo_gift_cost') "
+        "GROUP BY 1, 2) cs ON cs.cs_date = g.business_date AND cs.cs_channel = g.channel "
+        "WHERE business_date BETWEEN %s AND %s"
     )
     params: tuple = (from_date, to_date)
     if platform:
@@ -279,7 +299,8 @@ def get_ecom_overview(from_date: str, to_date: str, platform: Optional[str] = No
             # explicitly separate — Platform GMV is never Net Sales
             "platform_gmv": r["platform_gmv"],
             "net_sales": {"value": r["net_sales"], "status": r["net_sales_status"], "value_basis": r["net_sales_basis"]},
-            "cogs": {"value": r["total_cogs"], "status": "READY" if r["total_cogs"] is not None else "MISSING_SOURCE"},
+            "cogs": cogs_envelope(r["total_cogs"], r["sellable_cogs"], r["promo_gift_cost"],
+                                  r["sellable_cogs_status"], r["promo_gift_cost_status"]),
             "gm1": {"value": r["gm1"], "status": r["gm1_status"]},
             "gm1_margin_pct": r["gm1_margin"],
             "cm1": {"value": r["cm1"], "status": r["cm1_status"]},
@@ -304,7 +325,7 @@ def get_cost_breakdown(from_date: str, to_date: str, platform: Optional[str] = N
 
     cols = ", ".join(c for c, _ in _COST_LINE_LABELS)
     sql = (
-        f"SELECT business_date, channel, {cols} "
+        f"SELECT business_date, channel, {cols}, net_sales_status "
         "FROM mart.v_ceo_ecom_daily WHERE business_date BETWEEN %s AND %s"
     )
     params: tuple = (from_date, to_date)
@@ -319,16 +340,17 @@ def get_cost_breakdown(from_date: str, to_date: str, platform: Optional[str] = N
     out = []
     for r in rows:
         for column, cost_name in _COST_LINE_LABELS:
-            value = r.get(column)
+            # P14-B D2 — TikTok settlement-derived fees follow net_sales_status.
+            amount, status = cost_line(r["channel"], column, r.get(column), r.get("net_sales_status"))
             out.append({
                 "cost_name": cost_name,
-                "amount": value,
-                "amount_basis": "VND, per-day per-channel" if value is not None else None,
+                "amount": amount,
+                "amount_basis": "VND, per-day per-channel" if amount is not None else None,
                 "platform": r["channel"],
                 "business_date": r["business_date"],
                 "source": "mart.v_ceo_ecom_daily",
-                "status": _cost_status(column, value),
-                "value_basis": "DERIVED" if value is not None else None,
+                "status": status,
+                "value_basis": "DERIVED" if amount is not None else None,
             })
     return {"rows": out, "row_count": len(out), "date_range": [from_date, to_date], "platform_filter": platform,
             "note": "amount=NULL always means the real status column explains why — never a fabricated zero."}
@@ -435,6 +457,9 @@ def get_video_performance(from_date: str, to_date: str, platform: str,
 
     if platform != "TIKTOK":
         return {"rows": [], "row_count": 0, "platform": platform,
+                "coverage": {"status": "MISSING_SOURCE", "latest_available_date": None,
+                             "source_freshness_status": "MISSING_SOURCE", "source": None,
+                             "blocking_reason": "No Shopee video-grain source is wired into the approved mart layer."},
                 "note": "Video-grain performance is only proven for TIKTOK this phase."}
 
     sql = (
@@ -455,6 +480,18 @@ def get_video_performance(from_date: str, to_date: str, platform: str,
                 {"from_date": from_date, "to_date": to_date, "platform": platform,
                  "account_type": account_type, "limit": limit})
 
+    if account_type:
+        latest, cov = _fetch_freshness(
+            "get_video_performance_freshness",
+            "SELECT to_char(max(business_date), 'YYYY-MM-DD') FROM mart.v_ai_video_daily "
+            "WHERE channel = 'TIKTOK' AND account_type = %s", (account_type,), None)
+    else:
+        latest, cov = _fetch_freshness(
+            "get_video_performance_freshness",
+            "SELECT to_char(max(business_date), 'YYYY-MM-DD') FROM mart.v_ai_video_daily WHERE channel = 'TIKTOK'",
+            (), None)
+    coverage = freshness_envelope(from_date, to_date, len(rows), latest, cov, "mart.v_ai_video_daily")
+
     out = [{
         "video_id": r["video_id"], "business_date": r["business_date"], "account_type": r["account_type"],
         "creator": r["creator_username"] or r["creator_nick_name"], "creator_type": r["creator_author_type"],
@@ -464,7 +501,7 @@ def get_video_performance(from_date: str, to_date: str, platform: str,
     } for r in rows]
     return {
         "rows": out, "row_count": len(out), "date_range": [from_date, to_date], "platform": platform,
-        "account_type_filter": account_type,
+        "account_type_filter": account_type, "coverage": coverage,
         "note": "product_impressions/product_clicks are proven NOT available at this per-video grain "
                 "(confirmed absent in P7.1's real payload) and are deliberately not attached here. "
                 "account_type='ALL' vs 'AFFILIATE_ACCOUNTS' are separate slices — never sum across them.",
@@ -494,6 +531,12 @@ def get_live_performance(from_date: str, to_date: str, account_type: Optional[st
     rows = _run("get_live_performance", sql, params,
                 {"from_date": from_date, "to_date": to_date, "account_type": account_type, "limit": limit})
 
+    latest, cov = _fetch_freshness(
+        "get_live_performance_freshness",
+        "SELECT to_char(max(business_date), 'YYYY-MM-DD') FROM mart.v_ai_live_daily "
+        "WHERE channel = 'TIKTOK' AND account_type = %s", (account_type,), ("TIKTOK", "live"))
+    coverage = freshness_envelope(from_date, to_date, len(rows), latest, cov, "mart.v_ai_live_daily")
+
     out = [{
         "live_id": r["live_id"], "business_date": r["business_date"], "account_type": r["account_type"],
         "host_username": r["username"], "title": r["title"], "duration_seconds": r["duration_seconds"],
@@ -506,6 +549,7 @@ def get_live_performance(from_date: str, to_date: str, account_type: Optional[st
     } for r in rows]
     return {
         "rows": out, "row_count": len(out), "date_range": [from_date, to_date], "account_type": account_type,
+        "coverage": coverage,
         "shopee_live_status": "NO_PERMISSION — Shopee LIVE has no data here; do not substitute AMS content metrics for it.",
         "double_count_rule": "account_type='ALL' is the authoritative total slice. 'AFFILIATE_ACCOUNTS' is a "
                               "SUBSET of the same sessions, never an addition. Never sum ALL + AFFILIATE_ACCOUNTS.",
@@ -524,6 +568,9 @@ def get_affiliate_performance(from_date: str, to_date: str, platform: str, limit
     if platform != "SHOPEE":
         return {
             "rows": [], "row_count": 0, "platform": platform,
+            "coverage": {"status": "MISSING_SOURCE", "latest_available_date": None,
+                         "source_freshness_status": "MISSING_SOURCE", "source": None,
+                         "blocking_reason": "No dedicated TikTok affiliate creator view exists; see the routing note."},
             "note": "No dedicated TikTok affiliate creator/channel view exists in the approved mart "
                     "layer. TikTok's affiliate performance is exposed at the video/LIVE content grain "
                     "instead — call get_video_performance or get_live_performance with "
@@ -543,6 +590,12 @@ def get_affiliate_performance(from_date: str, to_date: str, platform: str, limit
     rows = _run("get_affiliate_performance", sql, params,
                 {"from_date": from_date, "to_date": to_date, "platform": platform, "limit": limit})
 
+    latest, cov = _fetch_freshness(
+        "get_affiliate_performance_freshness",
+        "SELECT to_char(max(business_date), 'YYYY-MM-DD') FROM mart.v_ai_affiliate_creator_daily "
+        "WHERE channel = 'SHOPEE'", (), ("SHOPEE", "affiliate_ams"))
+    coverage = freshness_envelope(from_date, to_date, len(rows), latest, cov, "mart.v_ai_affiliate_creator_daily")
+
     out = [{
         "affiliate": r["affiliate_name"] or r["affiliate_username"], "business_date": r["business_date"],
         "sales_affiliate_gmv": r["sales"], "orders": r["orders"], "items_sold": r["items_sold"],
@@ -553,6 +606,7 @@ def get_affiliate_performance(from_date: str, to_date: str, platform: str, limit
     } for r in rows]
     return {
         "rows": out, "row_count": len(out), "date_range": [from_date, to_date], "platform": platform,
+        "coverage": coverage,
         "note": "Affiliate GMV (sales_affiliate_gmv) is kept separate from Net Sales — never add it "
                 "into a Net Sales total. 'views' is not available at this grain (Shopee AMS creator "
                 "performance has no view-count field); left NULL, not fabricated.",

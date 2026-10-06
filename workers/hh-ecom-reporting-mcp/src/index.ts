@@ -56,7 +56,11 @@ function buildServer(env: Env): McpServer {
       "approved mart.v_ai_*/v_ceo_* views via the hh_ai_reader role. " +
       "ALWAYS check status/value_basis/blocking_reason fields before stating a " +
       "number as fact - a NULL value with a status field explains why, it is " +
-      "never a real zero. Platform GMV is never Net Sales. TikTok LIVE " +
+      "never a real zero. NULL != 0, UNKNOWN != ZERO, PARTIAL != COMPLETE, " +
+      "SOURCE_LAGGING != READY. An empty rows list is not zero activity - read the " +
+      "result's coverage.status first (NO_DATA = source covers the period and " +
+      "had no events; SOURCE_LAGGING/MISSING_SOURCE/PARTIAL_PERIOD_COVERAGE = not " +
+      "known yet). Platform GMV is never Net Sales. TikTok LIVE " +
       "account_type='ALL' is the authoritative total; 'AFFILIATE_ACCOUNTS' is a " +
       "SUBSET of it - never sum the two. Before concluding CM2 is complete or a " +
       "channel/campaign is profitable at CM2, call get_data_coverage and " +

@@ -14,6 +14,7 @@ import {
   validateRange,
 } from "./validation";
 import { CROSSWALK } from "./crosswalkData";
+import { cogsEnvelope, costLine, datesWithData, freshnessEnvelope, isKnown, periodKpis } from "./semantics";
 
 type Row = Record<string, unknown>;
 type Logger = (entry: Record<string, unknown>) => void;
@@ -21,12 +22,6 @@ type Logger = (entry: Record<string, unknown>) => void;
 // ---------------------------------------------------------------------------
 // shared cost/status envelope helpers - reused, not reimplemented per tool
 // ---------------------------------------------------------------------------
-
-const KNOWN_MISSING_COST_STATUS: Record<string, string> = {
-  ads_spend: "SEPARATE_API_REQUIRED",
-  booking_kol_koc: "MISSING_SOURCE",
-  live_inhouse_cost: "MISSING_SOURCE",
-};
 
 const COST_LINE_LABELS: [string, string][] = [
   ["fixed_fee", "platform_fixed_fee"],
@@ -45,11 +40,6 @@ const COST_LINE_LABELS: [string, string][] = [
   ["backoffice_cost", "backoffice_cost"],
 ];
 
-function costStatus(column: string, value: unknown): string {
-  if (value !== null && value !== undefined) return "READY";
-  return KNOWN_MISSING_COST_STATUS[column] ?? "MISSING_SOURCE";
-}
-
 function cm2MissingSources(row: Row): string[] {
   const missing: string[] = [];
   if (row.ads_spend === null) missing.push("TIKTOK_ADS_SEPARATE_API_REQUIRED");
@@ -57,6 +47,42 @@ function cm2MissingSources(row: Row): string[] {
   if (row.live_inhouse_cost === null) missing.push("LIVE_INHOUSE_COST_MISSING_SOURCE");
   if (row.backoffice_cost === null) missing.push("BACKOFFICE_COST_RULE_NOT_APPROVED");
   return missing;
+}
+
+// ---------------------------------------------------------------------------
+// P14-B D4 — freshness envelope for event-grain results. One fixed query:
+// the view's own latest loaded date + that source's row in
+// mart.v_ai_source_coverage (coverage_status and last successful watermark,
+// in ICT like business_date). domain=null means no incremental ingestion
+// domain feeds the view. See semantics.freshnessEnvelope for the rules.
+// ---------------------------------------------------------------------------
+
+async function fetchFreshness(
+  env: Env, log: Logger, toolName: string,
+  latestSql: string, latestParams: unknown[], domain: [string, string] | null
+): Promise<{ latestAvailableDate: string | null; coverage: { coverage_status: string | null; watermark_date: string | null; watermark_at: string | null } | null }> {
+  if (domain === null) {
+    const rows = await runQuery(env, toolName, `SELECT (${latestSql}) AS latest_available_date`, latestParams, {}, log);
+    return { latestAvailableDate: (rows[0]?.latest_available_date as string | null) ?? null, coverage: null };
+  }
+  const n = latestParams.length;
+  const rows = await runQuery(
+    env, toolName,
+    `SELECT (${latestSql}) AS latest_available_date, c.coverage_status, ` +
+      "to_char(c.last_success_at AT TIME ZONE 'Asia/Ho_Chi_Minh', 'YYYY-MM-DD\"T\"HH24:MI:SS\"+07:00\"') AS watermark_at, " +
+      "to_char((c.last_success_at AT TIME ZONE 'Asia/Ho_Chi_Minh')::date, 'YYYY-MM-DD') AS watermark_date " +
+      `FROM (SELECT 1) one LEFT JOIN mart.v_ai_source_coverage c ON c.platform = $${n + 1} AND c.source_name = $${n + 2}`,
+    [...latestParams, domain[0], domain[1]], {}, log
+  );
+  const r = rows[0] ?? {};
+  return {
+    latestAvailableDate: (r.latest_available_date as string | null) ?? null,
+    coverage: {
+      coverage_status: (r.coverage_status as string | null) ?? null,
+      watermark_date: (r.watermark_date as string | null) ?? null,
+      watermark_at: (r.watermark_at as string | null) ?? null,
+    },
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -74,7 +100,8 @@ export async function getEcomOverview(
   let sql =
     "SELECT g.business_date, g.channel, g.orders, g.units, g.platform_gmv, " +
     "g.net_sales, g.net_sales_status, g.net_sales_basis, " +
-    "g.total_cogs, g.gm1, g.gm1_margin, g.gm1_status, " +
+    "g.total_cogs, g.sellable_cogs, g.promo_gift_cost, cs.sellable_cogs_status, cs.promo_gift_cost_status, " +
+    "g.gm1, g.gm1_margin, g.gm1_status, " +
     "g.cm1, g.cm1_margin, g.cm1_status, " +
     "g.cm2, g.cm2_margin, g.cm2_status, g.cm2_known, g.cm2_known_status, " +
     "g.ads_spend, g.booking_kol_koc, g.live_inhouse_cost, g.backoffice_cost, " +
@@ -96,6 +123,14 @@ export async function getEcomOverview(
     "FROM mart.v_ceo_ecom_daily g " +
     "LEFT JOIN (SELECT business_date, channel, SUM(sold_units) AS sold_units, SUM(gift_units) AS gift_units " +
     "FROM mart.v_ai_product_daily GROUP BY 1,2) p ON p.business_date = g.business_date AND p.channel = g.channel " +
+    // P14-B D3 — COGS completeness is Gold's own coverage_status for the two
+    // COGS components (the flag that already drives gm1 = COGS_INCOMPLETE);
+    // reused here, never re-derived.
+    "LEFT JOIN (SELECT business_date, channel, " +
+    "max(availability_status) FILTER (WHERE metric_name = 'sellable_cogs') AS sellable_cogs_status, " +
+    "max(availability_status) FILTER (WHERE metric_name = 'promo_gift_cost') AS promo_gift_cost_status " +
+    "FROM mart.v_ai_metric_status WHERE metric_name IN ('sellable_cogs', 'promo_gift_cost') " +
+    "AND business_date BETWEEN $1 AND $2 GROUP BY 1,2) cs ON cs.business_date = g.business_date AND cs.channel = g.channel " +
     "WHERE g.business_date BETWEEN $1 AND $2";
   const params: unknown[] = [fromDate, toDate];
   if (platform) {
@@ -140,7 +175,7 @@ export async function getEcomOverview(
             : { visitors: null, status: "MISSING_SOURCE" })
         : { visitors: null, status: "NOT_EXPOSED_PUBLIC_API" },
       net_sales: { value: r.net_sales, status: r.net_sales_status, value_basis: r.net_sales_basis },
-      cogs: { value: r.total_cogs, status: r.total_cogs !== null ? "READY" : "MISSING_SOURCE" },
+      cogs: cogsEnvelope(r.total_cogs, r.sellable_cogs, r.promo_gift_cost, r.sellable_cogs_status, r.promo_gift_cost_status),
       gm1: { value: r.gm1, status: r.gm1_status },
       gm1_margin_pct: r.gm1_margin,
       cm1: { value: r.cm1, status: r.cm1_status },
@@ -215,61 +250,23 @@ export async function getEcomOverview(
   }
   out.sort((a, b) => (String(a.business_date) < String(b.business_date) ? -1 : String(a.business_date) > String(b.business_date) ? 1 : String(a.platform).localeCompare(String(b.platform))));
 
-  // P8.5 — period-level AOV/ASP. Formula is SUM(numerator)/SUM(denominator)
-  // over the requested range, NEVER an average of daily ratios. Computed
-  // per platform from the rows already fetched above (no extra query).
-  // A NULL component (e.g. TikTok net_sales withheld by the settlement-
-  // completeness guard) is skipped by summation like SQL SUM() would,
-  // and the period is flagged PARTIAL_PERIOD_COVERAGE so a NULL-skip is
-  // never silently indistinguishable from full coverage.
-  type PeriodAcc = {
-    netSales: number; netSalesAny: boolean; netSalesNullDates: number;
-    platformGmv: number; platformGmvAny: boolean;
-    orders: number; ordersAny: boolean;
-    soldUnits: number; soldUnitsAny: boolean; soldUnitsNullDates: number;
-  };
-  const mkAcc = (): PeriodAcc => ({
-    netSales: 0, netSalesAny: false, netSalesNullDates: 0,
-    platformGmv: 0, platformGmvAny: false,
-    orders: 0, ordersAny: false,
-    soldUnits: 0, soldUnitsAny: false, soldUnitsNullDates: 0,
-  });
-  const acc: Record<string, PeriodAcc> = {};
+  // P8.5 — period-level AOV/ASP, SUM(numerator)/SUM(denominator) over the
+  // requested range, per platform, from the rows already fetched above.
+  // P14-B D1 — a NULL numerator/denominator is never summed as 0: only dates
+  // where both are known are used, value is NULL when none are, and READY
+  // needs every date usable and fully settled (see semantics.periodKpis).
+  const byChannel = new Map<string, Row[]>();
   for (const r of rows) {
     const ch = String(r.channel);
-    if (!acc[ch]) acc[ch] = mkAcc();
-    const a = acc[ch];
-    if (r.net_sales !== null && r.net_sales !== undefined) { a.netSales += Number(r.net_sales); a.netSalesAny = true; }
-    else a.netSalesNullDates += 1;
-    if (r.platform_gmv !== null && r.platform_gmv !== undefined) { a.platformGmv += Number(r.platform_gmv); a.platformGmvAny = true; }
-    if (r.orders !== null && r.orders !== undefined) { a.orders += Number(r.orders); a.ordersAny = true; }
-    if (r.sold_units !== null && r.sold_units !== undefined) { a.soldUnits += Number(r.sold_units); a.soldUnitsAny = true; }
-    else a.soldUnitsNullDates += 1;
+    if (!byChannel.has(ch)) byChannel.set(ch, []);
+    byChannel.get(ch)!.push(r);
   }
-  const div = (num: number, den: number): number | null => (den !== 0 ? num / den : null);
   const period_kpis: Row = {};
-  for (const [ch, a] of Object.entries(acc)) {
-    const netSalesComplete = a.netSalesNullDates === 0;
-    const soldUnitsComplete = a.soldUnitsNullDates === 0;
-    period_kpis[ch] = {
-      aov_net_sales: {
-        value: a.ordersAny ? div(a.netSales, a.orders) : null,
-        status: !a.netSalesAny || !a.ordersAny ? "MISSING_SOURCE" : (netSalesComplete ? "READY" : "PARTIAL_PERIOD_COVERAGE"),
-      },
-      aov_platform_gmv: {
-        value: a.ordersAny ? div(a.platformGmv, a.orders) : null,
-        status: !a.platformGmvAny || !a.ordersAny ? "MISSING_SOURCE" : "READY",
-      },
-      asp_net_sales: {
-        value: a.soldUnitsAny ? div(a.netSales, a.soldUnits) : null,
-        status: !a.netSalesAny || !a.soldUnitsAny ? "MISSING_SOURCE" : (netSalesComplete && soldUnitsComplete ? "READY" : "PARTIAL_PERIOD_COVERAGE"),
-      },
-      asp_platform_gmv: {
-        value: a.soldUnitsAny ? div(a.platformGmv, a.soldUnits) : null,
-        status: !a.platformGmvAny || !a.soldUnitsAny ? "MISSING_SOURCE" : (soldUnitsComplete ? "READY" : "PARTIAL_PERIOD_COVERAGE"),
-      },
-      formula_basis: "SUM(numerator)/SUM(denominator) over the requested date range — never an average of daily ratios",
-    };
+  for (const [ch, days] of byChannel) {
+    period_kpis[ch] = periodKpis(days.map((r) => ({
+      net_sales: r.net_sales, net_sales_status: r.net_sales_status,
+      platform_gmv: r.platform_gmv, orders: r.orders, sold_units: r.sold_units,
+    })));
   }
 
   // P8.5 — TikTok product-funnel exposure (approved 2026-09-15).
@@ -280,6 +277,18 @@ export async function getEcomOverview(
   if (platform === "SHOPEE") {
     product_funnel = { status: "NOT_EXPOSED_PUBLIC_API", note: "Shopee's public API exposes no organic/paid product-page funnel outside Ads (see P8_5_API_ENDPOINT_FIELD_MATRIX.csv)." };
   } else {
+    // P14-B D5 — dates_with_data comes from the queried range itself, never a
+    // hardcoded list; freshness is reported separately.
+    const pfDateRows = await runQuery(
+      env, "get_ecom_overview_product_funnel_dates",
+      "SELECT array_agg(DISTINCT to_char(business_date, 'YYYY-MM-DD')) AS dates " +
+        "FROM mart.v_ai_product_traffic_daily WHERE channel = 'TIKTOK' AND business_date BETWEEN $1 AND $2",
+      [fromDate, toDate], { from_date: fromDate, to_date: toDate }, log
+    );
+    const pfDates = datesWithData(pfDateRows[0]?.dates);
+    const pfFresh = await fetchFreshness(env, log, "get_ecom_overview_product_funnel_freshness",
+      "SELECT to_char(max(business_date), 'YYYY-MM-DD') FROM mart.v_ai_product_traffic_daily WHERE channel = 'TIKTOK'",
+      [], ["TIKTOK", "product_analytics"]);
     const pfRows = await runQuery(
       env, "get_ecom_overview_product_funnel",
       "SELECT product_id, hh_sku, ean, " +
@@ -320,7 +329,11 @@ export async function getEcomOverview(
       [...arr].filter((p) => p[key] !== null).sort((a, b) => (a[key] as number) - (b[key] as number)).slice(0, n);
     product_funnel = {
       status: products.length ? "API_ACTUAL" : "NO_DATA",
-      dates_with_data: "2026-09-04, 2026-09-08, 2026-09-10, 2026-09-11, 2026-09-14 only (real, sparse, non-contiguous — never fabricated as continuous)",
+      dates_with_data: pfDates,
+      dates_with_data_note: "distinct business_date values with product-analytics rows inside the requested range " +
+        "(real, sparse, non-contiguous — never fabricated as continuous)",
+      coverage: freshnessEnvelope({ fromDate, toDate, rowCount: pfDates.length, ...pfFresh,
+        source: "mart.v_ai_product_traffic_daily" }),
       materiality_basis: "median SUM(impressions)/SUM(clicks) across products with a nonzero value in the requested range",
       impression_materiality_floor: impressionMateriality,
       click_materiality_floor: clickMateriality,
@@ -363,7 +376,7 @@ export async function getCostBreakdown(
   // but the CM2-bridge context a cost breakdown consumer needs).
   const affiliateDetailCols =
     "affiliate_commission_basis, affiliate_commission_settled, affiliate_commission_order_level, " +
-    "cm2_known, cm2_known_status, cm2_status";
+    "cm2_known, cm2_known_status, cm2_status, net_sales_status";
   let sql = `SELECT business_date, channel, ${cols}, ${adsDetailCols}, ${affiliateDetailCols} FROM mart.v_ceo_ecom_daily WHERE business_date BETWEEN $1 AND $2`;
   const params: unknown[] = [fromDate, toDate];
   if (platform) {
@@ -378,16 +391,19 @@ export async function getCostBreakdown(
   const out: Row[] = [];
   for (const r of rows) {
     for (const [column, costName] of COST_LINE_LABELS) {
-      const value = r[column];
+      // P14-B D2 — TikTok settlement-derived fees take their status from that
+      // date's settlement completeness (net_sales_status); an unsettled date
+      // never shows an unproven 0 as READY.
+      const { amount, status } = costLine(r.channel, column, r[column], r.net_sales_status);
       const entry: Row = {
         cost_name: costName,
-        amount: value,
-        amount_basis: value !== null && value !== undefined ? "VND, per-day per-channel" : null,
+        amount,
+        amount_basis: isKnown(amount) ? "VND, per-day per-channel" : null,
         platform: r.channel,
         business_date: r.business_date,
         source: "mart.v_ceo_ecom_daily",
-        status: costStatus(column, value),
-        value_basis: value !== null && value !== undefined ? "DERIVED" : null,
+        status,
+        value_basis: isKnown(amount) ? "DERIVED" : null,
       };
       // Shopee ads_spend: attach delivery + attribution-split detail.
       // Common delivery metrics (impressions/clicks) counted ONCE;
@@ -604,6 +620,8 @@ export async function getVideoPerformance(
   if (platform !== "TIKTOK") {
     return {
       rows: [], row_count: 0, platform,
+      coverage: { status: "MISSING_SOURCE", latest_available_date: null, source_freshness_status: "MISSING_SOURCE",
+        blocking_reason: "No Shopee video-grain source is wired into the approved mart layer.", source: null },
       note: "Video-grain performance is only proven for TIKTOK this phase.",
     };
   }
@@ -625,6 +643,15 @@ export async function getVideoPerformance(
   const rows = await runQuery(env, "get_video_performance", sql, params,
     { from_date: fromDate, to_date: toDate, platform, account_type: accountType, limit }, log);
 
+  const fresh = accountType
+    ? await fetchFreshness(env, log, "get_video_performance_freshness",
+        "SELECT to_char(max(business_date), 'YYYY-MM-DD') FROM mart.v_ai_video_daily WHERE channel = 'TIKTOK' AND account_type = $1",
+        [accountType], null)
+    : await fetchFreshness(env, log, "get_video_performance_freshness",
+        "SELECT to_char(max(business_date), 'YYYY-MM-DD') FROM mart.v_ai_video_daily WHERE channel = 'TIKTOK'",
+        [], null);
+  const coverage = freshnessEnvelope({ fromDate, toDate, rowCount: rows.length, ...fresh, source: "mart.v_ai_video_daily" });
+
   const out = rows.map((r) => ({
     video_id: r.video_id, business_date: r.business_date, account_type: r.account_type,
     creator: r.creator_username || r.creator_nick_name, creator_type: r.creator_author_type,
@@ -634,7 +661,7 @@ export async function getVideoPerformance(
   }));
   return {
     rows: out, row_count: out.length, date_range: [fromDate, toDate], platform,
-    account_type_filter: accountType,
+    account_type_filter: accountType, coverage,
     note: "product_impressions/product_clicks are proven NOT available at this per-video grain " +
       "(confirmed absent in P7.1's real payload) and are deliberately not attached here. " +
       "account_type='ALL' vs 'AFFILIATE_ACCOUNTS' are separate slices — never sum across them.",
@@ -670,6 +697,11 @@ export async function getLivePerformance(
   const rows = await runQuery(env, "get_live_performance", sql, params,
     { from_date: fromDate, to_date: toDate, account_type: accountType, limit }, log);
 
+  const fresh = await fetchFreshness(env, log, "get_live_performance_freshness",
+    "SELECT to_char(max(business_date), 'YYYY-MM-DD') FROM mart.v_ai_live_daily WHERE channel = 'TIKTOK' AND account_type = $1",
+    [accountType], ["TIKTOK", "live"]);
+  const coverage = freshnessEnvelope({ fromDate, toDate, rowCount: rows.length, ...fresh, source: "mart.v_ai_live_daily" });
+
   const out = rows.map((r) => ({
     live_id: r.live_id, business_date: r.business_date, account_type: r.account_type,
     host_username: r.username, title: r.title, duration_seconds: r.duration_seconds,
@@ -682,7 +714,7 @@ export async function getLivePerformance(
     status: "API_ACTUAL", value_basis: r.value_basis, source: "mart.v_ai_live_daily",
   }));
   return {
-    rows: out, row_count: out.length, date_range: [fromDate, toDate], account_type: accountType,
+    rows: out, row_count: out.length, date_range: [fromDate, toDate], account_type: accountType, coverage,
     shopee_live_status: "NO_PERMISSION — Shopee LIVE has no data here; do not substitute AMS content metrics for it.",
     double_count_rule: "account_type='ALL' is the authoritative total slice. 'AFFILIATE_ACCOUNTS' is a " +
       "SUBSET of the same sessions, never an addition. Never sum ALL + AFFILIATE_ACCOUNTS.",
@@ -705,6 +737,8 @@ export async function getAffiliatePerformance(
   if (platform !== "SHOPEE") {
     return {
       rows: [], row_count: 0, platform,
+      coverage: { status: "MISSING_SOURCE", latest_available_date: null, source_freshness_status: "MISSING_SOURCE",
+        blocking_reason: "No dedicated TikTok affiliate creator view exists; see the routing note.", source: null },
       note: "No dedicated TikTok affiliate creator/channel view exists in the approved mart " +
         "layer. TikTok's affiliate performance is exposed at the video/LIVE content grain " +
         "instead - call get_video_performance or get_live_performance with " +
@@ -725,6 +759,12 @@ export async function getAffiliatePerformance(
   const rows = await runQuery(env, "get_affiliate_performance", sql, params,
     { from_date: fromDate, to_date: toDate, platform, limit }, log);
 
+  const fresh = await fetchFreshness(env, log, "get_affiliate_performance_freshness",
+    "SELECT to_char(max(business_date), 'YYYY-MM-DD') FROM mart.v_ai_affiliate_creator_daily WHERE channel = 'SHOPEE'",
+    [], ["SHOPEE", "affiliate_ams"]);
+  const coverage = freshnessEnvelope({ fromDate, toDate, rowCount: rows.length, ...fresh,
+    source: "mart.v_ai_affiliate_creator_daily" });
+
   const out = rows.map((r) => ({
     affiliate: r.affiliate_name || r.affiliate_username, business_date: r.business_date,
     sales_affiliate_gmv: r.sales, orders: r.orders, items_sold: r.items_sold,
@@ -734,7 +774,7 @@ export async function getAffiliatePerformance(
     source: "mart.v_ai_affiliate_creator_daily",
   }));
   return {
-    rows: out, row_count: out.length, date_range: [fromDate, toDate], platform,
+    rows: out, row_count: out.length, date_range: [fromDate, toDate], platform, coverage,
     note: "Affiliate GMV (sales_affiliate_gmv) is kept separate from Net Sales — never add it " +
       "into a Net Sales total. 'views' is not available at this grain (Shopee AMS creator " +
       "performance has no view-count field); left NULL, not fabricated.",
