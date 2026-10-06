@@ -30,7 +30,8 @@ def test_cogs_envelope_matches_worker():
 def test_freshness_envelope_matches_worker():
     for c in V["freshness"]:
         i = c["in"]
-        e = freshness_envelope(i["fromDate"], i["toDate"], i["rowCount"], i["latestAvailableDate"], i["coverage"], "x")
+        e = freshness_envelope(i["fromDate"], i["toDate"], i["rowCount"], i["earliestAvailableDate"],
+                               i["latestAvailableDate"], i["coverage"], "x")
         assert (e["status"], e["source_freshness_status"]) == (c["status"], c["source_freshness_status"]), i
 
 

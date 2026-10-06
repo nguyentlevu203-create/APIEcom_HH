@@ -57,25 +57,83 @@ def cogs_envelope(total_cogs, sellable_cogs, promo_gift_cost, sellable_status, p
     return {"value": total_cogs, "status": first_not_ready or "MISSING_SOURCE"}
 
 
-def freshness_envelope(from_date: str, to_date: str, row_count: int, latest_available_date: Optional[str],
-                       coverage: Optional[dict], source: str) -> dict:
+_NOT_ZERO = "An empty result for this period is NOT zero activity."
+
+
+def freshness_envelope(from_date: str, to_date: str, row_count: int, earliest_available_date: Optional[str],
+                       latest_available_date: Optional[str], coverage: Optional[dict], source: str) -> dict:
     """D4 — coverage envelope for event-grain results. coverage=None means no
     incremental ingestion domain feeds the view; otherwise a dict with
-    coverage_status / watermark_date / watermark_at from mart.v_ai_source_coverage."""
-    latest = latest_available_date
-    base = {"latest_available_date": latest, "source": source}
+    coverage_status / watermark_date / watermark_at / date_from from
+    mart.v_ai_source_coverage. P14-B2: a period is known only inside a proven
+    [lower, upper] window — max(date) alone never proves earlier history."""
+    earliest, latest = earliest_available_date, latest_available_date
+    base = {"earliest_available_date": earliest, "latest_available_date": latest, "source": source}
+    loaded_covers = (earliest is not None and latest is not None
+                     and from_date >= earliest and to_date <= latest)
+    rng = f"{earliest or 'never'}..{latest or 'never'}"
+
     if coverage is None:
-        in_range = latest is not None and to_date <= latest
+        fresh = {**base, "source_freshness_status": "MISSING_SOURCE"}
+        if loaded_covers:
+            return {**fresh, "status": "READY" if row_count > 0 else "NO_DATA",
+                    "blocking_reason": None if row_count > 0 else
+                    "Period lies inside the loaded history and returned no rows."}
         if row_count > 0:
-            return {**base, "status": "READY" if in_range else "PARTIAL_PERIOD_COVERAGE",
-                    "source_freshness_status": "MISSING_SOURCE",
-                    "blocking_reason": None if in_range else
-                    f"No incremental ingestion domain feeds this view; data exists only through {latest}."}
-        return {**base, "status": "NO_DATA" if in_range else "SOURCE_LAGGING",
-                "source_freshness_status": "MISSING_SOURCE",
-                "blocking_reason": "Period lies inside the loaded history and returned no rows." if in_range else
-                f"No incremental ingestion domain feeds this view; data exists only through {latest or 'never'}. "
-                "An empty result for this period is NOT zero activity."}
+            return {**fresh, "status": "PARTIAL_PERIOD_COVERAGE",
+                    "blocking_reason": f"No incremental ingestion domain feeds this view; data is loaded only for {rng}."}
+        if earliest is not None and to_date < earliest:
+            return {**fresh, "status": "MISSING_SOURCE",
+                    "blocking_reason": f"Period predates the loaded history ({rng}). {_NOT_ZERO}"}
+        if earliest is not None and from_date < earliest and latest is not None and to_date <= latest:
+            return {**fresh, "status": "PARTIAL_PERIOD_COVERAGE",
+                    "blocking_reason": f"Period starts before the loaded history ({rng}). {_NOT_ZERO}"}
+        return {**fresh, "status": "SOURCE_LAGGING",
+                "blocking_reason": f"No incremental ingestion domain feeds this view; data is loaded only for {rng}. "
+                                   f"{_NOT_ZERO}"}
+
+    cs = coverage.get("coverage_status") or "MISSING_SOURCE"
+    wm_date = coverage.get("watermark_date")
+    lower = coverage.get("date_from")
+    fresh = {**base, "source_freshness_status": cs, "coverage_start_date": lower,
+             "watermark_at": coverage.get("watermark_at")}
+    if cs == "NO_PERMISSION":
+        return {**fresh, "status": "NO_PERMISSION", "blocking_reason": "Source has no API permission."}
+    # A successful poll past to_date proves absence only inside the source's
+    # proven window: never before its first loaded date, never without one.
+    covered_by_poll = (cs == "CURRENT" and wm_date is not None and wm_date > to_date
+                       and lower is not None and from_date >= lower)
+    covered = loaded_covers or covered_by_poll
+    if row_count > 0:
+        return {**fresh, "status": "READY" if covered else "PARTIAL_PERIOD_COVERAGE",
+                "blocking_reason": None if covered else
+                f"Source data is proven only for {lower or earliest or 'never'}..{latest or 'never'}; "
+                "dates outside it are unknown or may still arrive."}
+    if covered:
+        return {**fresh, "status": "NO_DATA",
+                "blocking_reason": "Period lies inside the loaded history and returned no rows." if loaded_covers else
+                f"Source is CURRENT, covered since {lower}, and was polled past the period end "
+                f"({coverage.get('watermark_at')}); no events in this period."}
+    lb = lower if lower is not None else earliest
+    if lb is not None and to_date < lb:
+        return {**fresh, "status": "MISSING_SOURCE",
+                "blocking_reason": f"Period predates the source's proven coverage start ({lb}). {_NOT_ZERO}"}
+    if lb is not None and from_date < lb:
+        return {**fresh, "status": "PARTIAL_PERIOD_COVERAGE",
+                "blocking_reason": f"Period starts before the source's proven coverage start ({lb}). {_NOT_ZERO}"}
+    if cs == "CURRENT" and lb is None:
+        return {**fresh, "status": "MISSING_SOURCE",
+                "blocking_reason": f"Source is CURRENT but has no loaded date to prove a coverage start. {_NOT_ZERO}"}
+    poll_in_period = wm_date is not None and wm_date >= from_date
+    # mart.v_ai_source_coverage NO_DATA means "nothing ever loaded" — reported as
+    # MISSING_SOURCE here, because this envelope's NO_DATA means "covered, no events".
+    if cs == "CURRENT":
+        status = "PARTIAL_PERIOD_COVERAGE" if poll_in_period else "SOURCE_LAGGING"
+    else:
+        status = "MISSING_SOURCE" if cs == "NO_DATA" else cs
+    return {**fresh, "status": status,
+            "blocking_reason": f"Source data available only through {latest or 'never'} (source status {cs}). "
+                               f"{_NOT_ZERO}"}
 
     cs = coverage.get("coverage_status") or "MISSING_SOURCE"
     wm_date = coverage.get("watermark_date")

@@ -152,50 +152,96 @@ export function cogsEnvelope(
 // D4 - freshness envelope for event-grain tools
 // ---------------------------------------------------------------------------
 
+export interface FreshnessCoverage {
+  coverage_status: string | null;
+  watermark_date: string | null;
+  watermark_at: string | null;
+  // mart.v_ai_source_coverage.date_from = MIN(business_date) ever loaded for
+  // this ingestion domain: the lower bound of the source's proven coverage.
+  date_from: string | null;
+}
+
 export interface FreshnessInput {
   fromDate: string;
   toDate: string;
   rowCount: number;
+  // MIN/MAX(business_date) of the queried view itself (same filter as the tool)
+  earliestAvailableDate: string | null;
   latestAvailableDate: string | null;
   // null = no incremental ingestion domain feeds this view at all
-  coverage: { coverage_status: string | null; watermark_date: string | null; watermark_at: string | null } | null;
+  coverage: FreshnessCoverage | null;
   source: string;
 }
 
+const NOT_ZERO = "An empty result for this period is NOT zero activity.";
+
+/** P14-B2 - a period is "known" only when it lies inside a proven window
+ * [lower bound, upper bound]. max(date) alone never proves history before
+ * the first loaded date: an empty period before it is unknown, not NO_DATA. */
 export function freshnessEnvelope(f: FreshnessInput): Row {
+  const earliest = f.earliestAvailableDate;
   const latest = f.latestAvailableDate;
-  const base = { latest_available_date: latest, source: f.source };
+  const base = { earliest_available_date: earliest, latest_available_date: latest, source: f.source };
+  const loadedCovers = earliest !== null && latest !== null && f.fromDate >= earliest && f.toDate <= latest;
+  const range = `${earliest ?? "never"}..${latest ?? "never"}`;
 
   if (f.coverage === null) {
-    const inRange = latest !== null && f.toDate <= latest;
-    if (f.rowCount > 0) {
-      return { ...base, status: inRange ? "READY" : "PARTIAL_PERIOD_COVERAGE", source_freshness_status: "MISSING_SOURCE",
-        blocking_reason: inRange ? null : `No incremental ingestion domain feeds this view; data exists only through ${latest}.` };
+    const fresh = { ...base, source_freshness_status: "MISSING_SOURCE" };
+    if (loadedCovers) {
+      return { ...fresh, status: f.rowCount > 0 ? "READY" : "NO_DATA",
+        blocking_reason: f.rowCount > 0 ? null : "Period lies inside the loaded history and returned no rows." };
     }
-    return { ...base, status: inRange ? "NO_DATA" : "SOURCE_LAGGING", source_freshness_status: "MISSING_SOURCE",
-      blocking_reason: inRange
-        ? "Period lies inside the loaded history and returned no rows."
-        : `No incremental ingestion domain feeds this view; data exists only through ${latest ?? "never"}. ` +
-          "An empty result for this period is NOT zero activity." };
+    if (f.rowCount > 0) {
+      return { ...fresh, status: "PARTIAL_PERIOD_COVERAGE",
+        blocking_reason: `No incremental ingestion domain feeds this view; data is loaded only for ${range}.` };
+    }
+    if (earliest !== null && f.toDate < earliest) {
+      return { ...fresh, status: "MISSING_SOURCE",
+        blocking_reason: `Period predates the loaded history (${range}). ${NOT_ZERO}` };
+    }
+    if (earliest !== null && f.fromDate < earliest && latest !== null && f.toDate <= latest) {
+      return { ...fresh, status: "PARTIAL_PERIOD_COVERAGE",
+        blocking_reason: `Period starts before the loaded history (${range}). ${NOT_ZERO}` };
+    }
+    return { ...fresh, status: "SOURCE_LAGGING",
+      blocking_reason: `No incremental ingestion domain feeds this view; data is loaded only for ${range}. ${NOT_ZERO}` };
   }
 
   const cs = f.coverage.coverage_status ?? "MISSING_SOURCE";
-  const freshness = { ...base, source_freshness_status: cs, watermark_at: f.coverage.watermark_at };
+  const lowerBound = f.coverage.date_from;
+  const fresh = { ...base, source_freshness_status: cs, coverage_start_date: lowerBound, watermark_at: f.coverage.watermark_at };
   if (cs === "NO_PERMISSION") {
-    return { ...freshness, status: "NO_PERMISSION", blocking_reason: "Source has no API permission." };
+    return { ...fresh, status: "NO_PERMISSION", blocking_reason: "Source has no API permission." };
   }
-  const coveredByData = latest !== null && f.toDate <= latest;
-  const coveredByPoll = cs === "CURRENT" && f.coverage.watermark_date !== null && f.coverage.watermark_date > f.toDate;
-  const covered = coveredByData || coveredByPoll;
+  // A successful poll past toDate proves absence only inside the source's
+  // proven window: never before its first loaded date, never without one.
+  const coveredByPoll = cs === "CURRENT" && f.coverage.watermark_date !== null && f.coverage.watermark_date > f.toDate &&
+    lowerBound !== null && f.fromDate >= lowerBound;
+  const covered = loadedCovers || coveredByPoll;
   if (f.rowCount > 0) {
-    return { ...freshness, status: covered ? "READY" : "PARTIAL_PERIOD_COVERAGE",
-      blocking_reason: covered ? null : `Source data available only through ${latest}; later dates in the period may still arrive.` };
+    return { ...fresh, status: covered ? "READY" : "PARTIAL_PERIOD_COVERAGE",
+      blocking_reason: covered ? null : `Source data is proven only for ${lowerBound ?? earliest ?? "never"}..${latest ?? "never"}; ` +
+        "dates outside it are unknown or may still arrive." };
   }
   if (covered) {
-    return { ...freshness, status: "NO_DATA",
-      blocking_reason: coveredByData
+    return { ...fresh, status: "NO_DATA",
+      blocking_reason: loadedCovers
         ? "Period lies inside the loaded history and returned no rows."
-        : `Source is CURRENT and was polled past the period end (${f.coverage.watermark_at}); no events in this period.` };
+        : `Source is CURRENT, covered since ${lowerBound}, and was polled past the period end (${f.coverage.watermark_at}); ` +
+          "no events in this period." };
+  }
+  const lb = lowerBound ?? earliest;
+  if (lb !== null && f.toDate < lb) {
+    return { ...fresh, status: "MISSING_SOURCE",
+      blocking_reason: `Period predates the source's proven coverage start (${lb}). ${NOT_ZERO}` };
+  }
+  if (lb !== null && f.fromDate < lb) {
+    return { ...fresh, status: "PARTIAL_PERIOD_COVERAGE",
+      blocking_reason: `Period starts before the source's proven coverage start (${lb}). ${NOT_ZERO}` };
+  }
+  if (cs === "CURRENT" && lb === null) {
+    return { ...fresh, status: "MISSING_SOURCE",
+      blocking_reason: `Source is CURRENT but has no loaded date to prove a coverage start. ${NOT_ZERO}` };
   }
   // A CURRENT source whose poll already reached into the period: partly known.
   // One whose poll has not reached the period yet (e.g. AMS T-2 latency): lagging.
@@ -204,9 +250,8 @@ export function freshnessEnvelope(f: FreshnessInput): Row {
   const pollInPeriod = f.coverage.watermark_date !== null && f.coverage.watermark_date >= f.fromDate;
   const status = cs === "CURRENT" ? (pollInPeriod ? "PARTIAL_PERIOD_COVERAGE" : "SOURCE_LAGGING")
     : cs === "NO_DATA" ? "MISSING_SOURCE" : cs;
-  return { ...freshness, status,
-    blocking_reason: `Source data available only through ${latest ?? "never"} (source status ${cs}). ` +
-      "An empty result for this period is NOT zero activity." };
+  return { ...fresh, status,
+    blocking_reason: `Source data available only through ${latest ?? "never"} (source status ${cs}). ${NOT_ZERO}` };
 }
 
 // ---------------------------------------------------------------------------
@@ -216,4 +261,12 @@ export function freshnessEnvelope(f: FreshnessInput): Row {
 export function datesWithData(dates: unknown): string[] {
   if (!Array.isArray(dates)) return [];
   return dates.map(String).sort();
+}
+
+/** P14-B2 - product_funnel exposes exactly one semantic state: its coverage
+ * status, with READY (covered and has rows) shown as API_ACTUAL. Never an
+ * independent rows-based NO_DATA that could contradict SOURCE_LAGGING. */
+export function productFunnelStatus(coverageStatus: unknown): string {
+  const s = String(coverageStatus);
+  return s === "READY" ? "API_ACTUAL" : s;
 }

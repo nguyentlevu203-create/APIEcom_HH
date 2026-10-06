@@ -14,7 +14,8 @@ import {
   validateRange,
 } from "./validation";
 import { CROSSWALK } from "./crosswalkData";
-import { cogsEnvelope, costLine, datesWithData, freshnessEnvelope, isKnown, periodKpis } from "./semantics";
+import { cogsEnvelope, costLine, datesWithData, freshnessEnvelope, isKnown, periodKpis, productFunnelStatus } from "./semantics";
+import type { FreshnessInput } from "./semantics";
 
 type Row = Record<string, unknown>;
 type Logger = (entry: Record<string, unknown>) => void;
@@ -51,36 +52,51 @@ function cm2MissingSources(row: Row): string[] {
 
 // ---------------------------------------------------------------------------
 // P14-B D4 — freshness envelope for event-grain results. One fixed query:
-// the view's own latest loaded date + that source's row in
-// mart.v_ai_source_coverage (coverage_status and last successful watermark,
-// in ICT like business_date). domain=null means no incremental ingestion
-// domain feeds the view. See semantics.freshnessEnvelope for the rules.
+// the view's own MIN/MAX loaded business_date (P14-B2: both bounds, so a
+// period before the first loaded date is never read as covered) + that
+// source's row in mart.v_ai_source_coverage (coverage_status, date_from =
+// first loaded date of the domain, last successful watermark in ICT like
+// business_date). domain=null means no incremental ingestion domain feeds
+// the view. rangeFrom is always a fixed literal FROM/WHERE fragment of this
+// file; only its $n params vary. See semantics.freshnessEnvelope for rules.
 // ---------------------------------------------------------------------------
+
+type Freshness = Pick<FreshnessInput, "earliestAvailableDate" | "latestAvailableDate" | "coverage">;
 
 async function fetchFreshness(
   env: Env, log: Logger, toolName: string,
-  latestSql: string, latestParams: unknown[], domain: [string, string] | null
-): Promise<{ latestAvailableDate: string | null; coverage: { coverage_status: string | null; watermark_date: string | null; watermark_at: string | null } | null }> {
+  rangeFrom: string, rangeParams: unknown[], domain: [string, string] | null
+): Promise<Freshness> {
+  const range = "SELECT to_char(min(business_date), 'YYYY-MM-DD') AS earliest_available_date, " +
+    `to_char(max(business_date), 'YYYY-MM-DD') AS latest_available_date FROM ${rangeFrom}`;
   if (domain === null) {
-    const rows = await runQuery(env, toolName, `SELECT (${latestSql}) AS latest_available_date`, latestParams, {}, log);
-    return { latestAvailableDate: (rows[0]?.latest_available_date as string | null) ?? null, coverage: null };
+    const rows = await runQuery(env, toolName, range, rangeParams, {}, log);
+    const r = rows[0] ?? {};
+    return {
+      earliestAvailableDate: (r.earliest_available_date as string | null) ?? null,
+      latestAvailableDate: (r.latest_available_date as string | null) ?? null,
+      coverage: null,
+    };
   }
-  const n = latestParams.length;
+  const n = rangeParams.length;
   const rows = await runQuery(
     env, toolName,
-    `SELECT (${latestSql}) AS latest_available_date, c.coverage_status, ` +
+    "SELECT r.earliest_available_date, r.latest_available_date, c.coverage_status, " +
+      "to_char(c.date_from, 'YYYY-MM-DD') AS coverage_date_from, " +
       "to_char(c.last_success_at AT TIME ZONE 'Asia/Ho_Chi_Minh', 'YYYY-MM-DD\"T\"HH24:MI:SS\"+07:00\"') AS watermark_at, " +
       "to_char((c.last_success_at AT TIME ZONE 'Asia/Ho_Chi_Minh')::date, 'YYYY-MM-DD') AS watermark_date " +
-      `FROM (SELECT 1) one LEFT JOIN mart.v_ai_source_coverage c ON c.platform = $${n + 1} AND c.source_name = $${n + 2}`,
-    [...latestParams, domain[0], domain[1]], {}, log
+      `FROM (${range}) r LEFT JOIN mart.v_ai_source_coverage c ON c.platform = $${n + 1} AND c.source_name = $${n + 2}`,
+    [...rangeParams, domain[0], domain[1]], {}, log
   );
   const r = rows[0] ?? {};
   return {
+    earliestAvailableDate: (r.earliest_available_date as string | null) ?? null,
     latestAvailableDate: (r.latest_available_date as string | null) ?? null,
     coverage: {
       coverage_status: (r.coverage_status as string | null) ?? null,
       watermark_date: (r.watermark_date as string | null) ?? null,
       watermark_at: (r.watermark_at as string | null) ?? null,
+      date_from: (r.coverage_date_from as string | null) ?? null,
     },
   };
 }
@@ -292,7 +308,7 @@ export async function getEcomOverview(
     );
     const pfDates = datesWithData(pfDateRows[0]?.dates);
     const pfFresh = await fetchFreshness(env, log, "get_ecom_overview_product_funnel_freshness",
-      "SELECT to_char(max(business_date), 'YYYY-MM-DD') FROM mart.v_ai_product_traffic_daily WHERE channel = 'TIKTOK'",
+      "mart.v_ai_product_traffic_daily WHERE channel = 'TIKTOK'",
       [], ["TIKTOK", "product_analytics"]);
     const pfRows = await runQuery(
       env, "get_ecom_overview_product_funnel",
@@ -332,13 +348,16 @@ export async function getEcomOverview(
       [...arr].sort((a, b) => b[key] - a[key]).slice(0, n);
     const lowest = (arr: ProductAgg[], key: "ctr" | "click_to_order", n = 10) =>
       [...arr].filter((p) => p[key] !== null).sort((a, b) => (a[key] as number) - (b[key] as number)).slice(0, n);
+    // P14-B2 — coverage computed once; status is derived from it, never
+    // from row count alone (no NO_DATA beside a SOURCE_LAGGING coverage).
+    const pfCoverage = freshnessEnvelope({ fromDate, toDate, rowCount: pfDates.length, ...pfFresh,
+      source: "mart.v_ai_product_traffic_daily" });
     product_funnel = {
-      status: products.length ? "API_ACTUAL" : "NO_DATA",
+      status: productFunnelStatus(pfCoverage.status),
       dates_with_data: pfDates,
       dates_with_data_note: "distinct business_date values with product-analytics rows inside the requested range " +
         "(real, sparse, non-contiguous — never fabricated as continuous)",
-      coverage: freshnessEnvelope({ fromDate, toDate, rowCount: pfDates.length, ...pfFresh,
-        source: "mart.v_ai_product_traffic_daily" }),
+      coverage: pfCoverage,
       materiality_basis: "median SUM(impressions)/SUM(clicks) across products with a nonzero value in the requested range",
       impression_materiality_floor: impressionMateriality,
       click_materiality_floor: clickMateriality,
@@ -625,7 +644,7 @@ export async function getVideoPerformance(
   if (platform !== "TIKTOK") {
     return {
       rows: [], row_count: 0, platform,
-      coverage: { status: "MISSING_SOURCE", latest_available_date: null, source_freshness_status: "MISSING_SOURCE",
+      coverage: { status: "MISSING_SOURCE", earliest_available_date: null, latest_available_date: null, source_freshness_status: "MISSING_SOURCE",
         blocking_reason: "No Shopee video-grain source is wired into the approved mart layer.", source: null },
       note: "Video-grain performance is only proven for TIKTOK this phase.",
     };
@@ -650,10 +669,10 @@ export async function getVideoPerformance(
 
   const fresh = accountType
     ? await fetchFreshness(env, log, "get_video_performance_freshness",
-        "SELECT to_char(max(business_date), 'YYYY-MM-DD') FROM mart.v_ai_video_daily WHERE channel = 'TIKTOK' AND account_type = $1",
+        "mart.v_ai_video_daily WHERE channel = 'TIKTOK' AND account_type = $1",
         [accountType], null)
     : await fetchFreshness(env, log, "get_video_performance_freshness",
-        "SELECT to_char(max(business_date), 'YYYY-MM-DD') FROM mart.v_ai_video_daily WHERE channel = 'TIKTOK'",
+        "mart.v_ai_video_daily WHERE channel = 'TIKTOK'",
         [], null);
   const coverage = freshnessEnvelope({ fromDate, toDate, rowCount: rows.length, ...fresh, source: "mart.v_ai_video_daily" });
 
@@ -703,7 +722,7 @@ export async function getLivePerformance(
     { from_date: fromDate, to_date: toDate, account_type: accountType, limit }, log);
 
   const fresh = await fetchFreshness(env, log, "get_live_performance_freshness",
-    "SELECT to_char(max(business_date), 'YYYY-MM-DD') FROM mart.v_ai_live_daily WHERE channel = 'TIKTOK' AND account_type = $1",
+    "mart.v_ai_live_daily WHERE channel = 'TIKTOK' AND account_type = $1",
     [accountType], ["TIKTOK", "live"]);
   const coverage = freshnessEnvelope({ fromDate, toDate, rowCount: rows.length, ...fresh, source: "mart.v_ai_live_daily" });
 
@@ -742,7 +761,7 @@ export async function getAffiliatePerformance(
   if (platform !== "SHOPEE") {
     return {
       rows: [], row_count: 0, platform,
-      coverage: { status: "MISSING_SOURCE", latest_available_date: null, source_freshness_status: "MISSING_SOURCE",
+      coverage: { status: "MISSING_SOURCE", earliest_available_date: null, latest_available_date: null, source_freshness_status: "MISSING_SOURCE",
         blocking_reason: "No dedicated TikTok affiliate creator view exists; see the routing note.", source: null },
       note: "No dedicated TikTok affiliate creator/channel view exists in the approved mart " +
         "layer. TikTok's affiliate performance is exposed at the video/LIVE content grain " +
@@ -765,7 +784,7 @@ export async function getAffiliatePerformance(
     { from_date: fromDate, to_date: toDate, platform, limit }, log);
 
   const fresh = await fetchFreshness(env, log, "get_affiliate_performance_freshness",
-    "SELECT to_char(max(business_date), 'YYYY-MM-DD') FROM mart.v_ai_affiliate_creator_daily WHERE channel = 'SHOPEE'",
+    "mart.v_ai_affiliate_creator_daily WHERE channel = 'SHOPEE'",
     [], ["SHOPEE", "affiliate_ams"]);
   const coverage = freshnessEnvelope({ fromDate, toDate, rowCount: rows.length, ...fresh,
     source: "mart.v_ai_affiliate_creator_daily" });

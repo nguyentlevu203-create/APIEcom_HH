@@ -28,7 +28,7 @@ test("no arbitrary SQL tool or input, no write statements", () => {
 
 test("interpolated SQL fragments are code constants or $n placeholders only", () => {
   const interps = [...qs.matchAll(/\$\{([^}]+)\}/g)].map((m) => m[1].trim());
-  const allowed = /^(cols|adsDetailCols|affiliateDetailCols|latestSql|params\.length \+ 1|n \+ [12]|latest(?: \?\? "never")?|f\.coverage\.watermark_at|cs)$/;
+  const allowed = /^(cols|adsDetailCols|affiliateDetailCols|rangeFrom|range|params\.length \+ 1|n \+ [12]|latest(?: \?\? "never")?|f\.coverage\.watermark_at|cs)$/;
   for (const i of interps) assert.match(i, allowed, `unexpected interpolation: ${i}`);
 });
 
@@ -59,4 +59,18 @@ test("audit log carries metadata only, never connection string/token/payload", (
 test("COGS status aggregation never uses max() on text (would rank READY above COGS_INCOMPLETE)", () => {
   assert.doesNotMatch(qs, /max\(availability_status\)/);
   assert.match(qs, /bool_or\(availability_status = 'COGS_INCOMPLETE'\) FILTER \(WHERE metric_name = 'sellable_cogs'\)/);
+});
+
+test("P14-B2: freshness probe reads both MIN and MAX business_date; rangeFrom is a fixed mart literal", () => {
+  assert.match(qs, /to_char\(min\(business_date\), 'YYYY-MM-DD'\) AS earliest_available_date/);
+  assert.match(qs, /to_char\(c\.date_from, 'YYYY-MM-DD'\) AS coverage_date_from/);
+  const calls = [...qs.matchAll(/fetchFreshness\(env, log, "\w+",\s*("[^"]*"|\S+)/g)].map((m) => m[1]);
+  assert.ok(calls.length >= 5, `found ${calls.length} fetchFreshness calls`);
+  for (const a of calls) assert.match(a, /^"mart\.v_ai_\w+ WHERE [^"$]*(\$1)?[^"$]*"$/, `non-literal range: ${a}`);
+});
+
+test("P14-B2: product_funnel status derives from its coverage, never from row count alone", () => {
+  assert.doesNotMatch(qs, /products\.length \? "API_ACTUAL" : "NO_DATA"/);
+  assert.match(qs, /status: productFunnelStatus\(pfCoverage\.status\)/);
+  assert.match(qs, /coverage: pfCoverage,/);
 });

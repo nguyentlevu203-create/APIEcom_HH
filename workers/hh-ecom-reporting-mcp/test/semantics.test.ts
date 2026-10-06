@@ -4,7 +4,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import {
-  cogsEnvelope, costLine, datesWithData, freshnessEnvelope, periodKpis, type PeriodDayInput,
+  cogsEnvelope, costLine, datesWithData, freshnessEnvelope, periodKpis, productFunnelStatus, type PeriodDayInput,
 } from "../src/semantics.ts";
 
 const day = (o: Partial<PeriodDayInput>): PeriodDayInput => ({
@@ -103,7 +103,7 @@ test("D3: no COGS components at all -> NULL, not the view's COALESCE 0", () => {
 
 test("D4: stale video source (no incremental domain) + later date -> SOURCE_LAGGING, not zero", () => {
   const e = freshnessEnvelope({ fromDate: "2026-10-06", toDate: "2026-10-06", rowCount: 0,
-    latestAvailableDate: "2026-09-12", coverage: null, source: "mart.v_ai_video_daily" });
+    earliestAvailableDate: "2026-09-01", latestAvailableDate: "2026-09-12", coverage: null, source: "mart.v_ai_video_daily" });
   assert.equal(e.status, "SOURCE_LAGGING");
   assert.equal(e.source_freshness_status, "MISSING_SOURCE");
   assert.equal(e.latest_available_date, "2026-09-12");
@@ -111,50 +111,134 @@ test("D4: stale video source (no incremental domain) + later date -> SOURCE_LAGG
 });
 
 test("D4: current sparse source polled past the period + no events -> NO_DATA, not lag", () => {
-  const e = freshnessEnvelope({ fromDate: "2026-10-05", toDate: "2026-10-05", rowCount: 0, latestAvailableDate: "2026-10-03",
-    coverage: { coverage_status: "CURRENT", watermark_date: "2026-10-06", watermark_at: "2026-10-06T08:46:18+07:00" },
+  const e = freshnessEnvelope({ fromDate: "2026-10-05", toDate: "2026-10-05", rowCount: 0, earliestAvailableDate: "2026-09-01", latestAvailableDate: "2026-10-03",
+    coverage: { coverage_status: "CURRENT", watermark_date: "2026-10-06", watermark_at: "2026-10-06T08:46:18+07:00", date_from: "2026-09-01" },
     source: "mart.v_ai_affiliate_creator_daily" });
   assert.equal(e.status, "NO_DATA");
   assert.equal(e.source_freshness_status, "CURRENT");
 });
 
 test("D4: current source whose poll has not passed the period end -> PARTIAL, not NO_DATA", () => {
-  const e = freshnessEnvelope({ fromDate: "2026-10-06", toDate: "2026-10-06", rowCount: 0, latestAvailableDate: "2026-10-05",
-    coverage: { coverage_status: "CURRENT", watermark_date: "2026-10-06", watermark_at: "2026-10-06T10:02:19+07:00" },
+  const e = freshnessEnvelope({ fromDate: "2026-10-06", toDate: "2026-10-06", rowCount: 0, earliestAvailableDate: "2026-09-01", latestAvailableDate: "2026-10-05",
+    coverage: { coverage_status: "CURRENT", watermark_date: "2026-10-06", watermark_at: "2026-10-06T10:02:19+07:00", date_from: "2026-09-01" },
     source: "x" });
   assert.equal(e.status, "PARTIAL_PERIOD_COVERAGE");
 });
 
 test("D4: CURRENT source whose poll has not reached the period yet -> SOURCE_LAGGING", () => {
-  const e = freshnessEnvelope({ fromDate: "2026-10-06", toDate: "2026-10-06", rowCount: 0, latestAvailableDate: "2026-10-04",
-    coverage: { coverage_status: "CURRENT", watermark_date: "2026-10-04", watermark_at: "2026-10-04T23:59:59+07:00" },
+  const e = freshnessEnvelope({ fromDate: "2026-10-06", toDate: "2026-10-06", rowCount: 0, earliestAvailableDate: "2026-09-01", latestAvailableDate: "2026-10-04",
+    coverage: { coverage_status: "CURRENT", watermark_date: "2026-10-04", watermark_at: "2026-10-04T23:59:59+07:00", date_from: "2026-09-01" },
     source: "mart.v_ai_affiliate_creator_daily" });
   assert.equal(e.status, "SOURCE_LAGGING");
   assert.equal(e.source_freshness_status, "CURRENT");
 });
 
 test("D4: MART says SOURCE_LAGGING -> stays SOURCE_LAGGING for an uncovered empty period", () => {
-  const e = freshnessEnvelope({ fromDate: "2026-10-06", toDate: "2026-10-06", rowCount: 0, latestAvailableDate: "2026-10-04",
-    coverage: { coverage_status: "SOURCE_LAGGING", watermark_date: "2026-10-06", watermark_at: "t" }, source: "mart.v_ai_live_daily" });
+  const e = freshnessEnvelope({ fromDate: "2026-10-06", toDate: "2026-10-06", rowCount: 0, earliestAvailableDate: "2026-09-01", latestAvailableDate: "2026-10-04",
+    coverage: { coverage_status: "SOURCE_LAGGING", watermark_date: "2026-10-06", watermark_at: "t", date_from: "2026-09-01" }, source: "mart.v_ai_live_daily" });
   assert.equal(e.status, "SOURCE_LAGGING");
 });
 
 test("D4: empty period inside loaded history -> NO_DATA", () => {
-  const e = freshnessEnvelope({ fromDate: "2026-09-20", toDate: "2026-09-20", rowCount: 0, latestAvailableDate: "2026-10-04",
-    coverage: { coverage_status: "SOURCE_LAGGING", watermark_date: "2026-10-06", watermark_at: "t" }, source: "x" });
+  const e = freshnessEnvelope({ fromDate: "2026-09-20", toDate: "2026-09-20", rowCount: 0, earliestAvailableDate: "2026-09-01", latestAvailableDate: "2026-10-04",
+    coverage: { coverage_status: "SOURCE_LAGGING", watermark_date: "2026-10-06", watermark_at: "t", date_from: "2026-09-01" }, source: "x" });
   assert.equal(e.status, "NO_DATA");
 });
 
 test("D4: NO_PERMISSION remains NO_PERMISSION", () => {
-  const e = freshnessEnvelope({ fromDate: "2026-10-06", toDate: "2026-10-06", rowCount: 0, latestAvailableDate: null,
-    coverage: { coverage_status: "NO_PERMISSION", watermark_date: null, watermark_at: null }, source: "x" });
+  const e = freshnessEnvelope({ fromDate: "2026-10-06", toDate: "2026-10-06", rowCount: 0, earliestAvailableDate: null, latestAvailableDate: null,
+    coverage: { coverage_status: "NO_PERMISSION", watermark_date: null, watermark_at: null, date_from: null }, source: "x" });
   assert.equal(e.status, "NO_PERMISSION");
 });
 
 test("D4: rows returned but period extends past loaded data -> PARTIAL_PERIOD_COVERAGE", () => {
-  const e = freshnessEnvelope({ fromDate: "2026-10-01", toDate: "2026-10-06", rowCount: 12, latestAvailableDate: "2026-10-04",
-    coverage: { coverage_status: "SOURCE_LAGGING", watermark_date: "2026-10-06", watermark_at: "t" }, source: "x" });
+  const e = freshnessEnvelope({ fromDate: "2026-10-01", toDate: "2026-10-06", rowCount: 12, earliestAvailableDate: "2026-09-01", latestAvailableDate: "2026-10-04",
+    coverage: { coverage_status: "SOURCE_LAGGING", watermark_date: "2026-10-06", watermark_at: "t", date_from: "2026-09-01" }, source: "x" });
   assert.equal(e.status, "PARTIAL_PERIOD_COVERAGE");
+});
+
+// --- P14-B2: lower bound of proven coverage -------------------------------
+
+const HIST = { earliestAvailableDate: "2026-09-01", latestAvailableDate: "2026-09-12", coverage: null, source: "x" };
+const CURRENT_SINCE = (dateFrom: string | null) =>
+  ({ coverage_status: "CURRENT", watermark_date: "2026-10-06", watermark_at: "2026-10-06T08:00:00+07:00", date_from: dateFrom });
+
+test("B2-A: empty period before the first loaded date -> NOT NO_DATA", () => {
+  const e = freshnessEnvelope({ ...HIST, fromDate: "2026-08-20", toDate: "2026-08-25", rowCount: 0 });
+  assert.notEqual(e.status, "NO_DATA");
+  assert.equal(e.status, "MISSING_SOURCE");
+  assert.equal(e.earliest_available_date, "2026-09-01");
+  assert.match(String(e.blocking_reason), /predates the loaded history/);
+});
+
+test("B2-B: empty period inside proven loaded history -> NO_DATA", () => {
+  const e = freshnessEnvelope({ ...HIST, fromDate: "2026-09-05", toDate: "2026-09-05", rowCount: 0 });
+  assert.equal(e.status, "NO_DATA");
+});
+
+test("B2-C: period overlapping the lower boundary -> PARTIAL, never READY/NO_DATA", () => {
+  for (const rowCount of [0, 3]) {
+    const e = freshnessEnvelope({ ...HIST, fromDate: "2026-08-30", toDate: "2026-09-05", rowCount });
+    assert.equal(e.status, "PARTIAL_PERIOD_COVERAGE", `rowCount=${rowCount}`);
+  }
+});
+
+test("B2-C: max(date) alone never proves coverage (no earliest -> not NO_DATA)", () => {
+  const e = freshnessEnvelope({ ...HIST, earliestAvailableDate: null, fromDate: "2026-09-05", toDate: "2026-09-05", rowCount: 0 });
+  assert.notEqual(e.status, "NO_DATA");
+});
+
+test("B2-D: CURRENT sparse source polled past, period inside proven window, no events -> NO_DATA", () => {
+  const e = freshnessEnvelope({ fromDate: "2026-10-05", toDate: "2026-10-05", rowCount: 0,
+    earliestAvailableDate: "2026-09-03", latestAvailableDate: "2026-10-03", coverage: CURRENT_SINCE("2026-09-01"), source: "x" });
+  assert.equal(e.status, "NO_DATA");
+  assert.equal(e.coverage_start_date, "2026-09-01");
+});
+
+test("B2-E: CURRENT source polled past, period predates proven coverage start -> NOT NO_DATA", () => {
+  const e = freshnessEnvelope({ fromDate: "2026-08-20", toDate: "2026-08-25", rowCount: 0,
+    earliestAvailableDate: "2026-09-01", latestAvailableDate: "2026-10-03", coverage: CURRENT_SINCE("2026-09-01"), source: "x" });
+  assert.notEqual(e.status, "NO_DATA");
+  assert.equal(e.status, "MISSING_SOURCE");
+});
+
+test("B2-E: CURRENT source polled past with no provable coverage start -> conservative, not NO_DATA", () => {
+  const e = freshnessEnvelope({ fromDate: "2026-10-05", toDate: "2026-10-05", rowCount: 0,
+    earliestAvailableDate: null, latestAvailableDate: null, coverage: CURRENT_SINCE(null), source: "x" });
+  assert.equal(e.status, "MISSING_SOURCE");
+});
+
+// --- P14-B2: product_funnel status is the coverage status -------------------
+
+const pfEnvelope = (rowCount: number, coverage: ReturnType<typeof CURRENT_SINCE> | Record<string, unknown>, from: string, to: string) =>
+  freshnessEnvelope({ fromDate: from, toDate: to, rowCount, earliestAvailableDate: "2026-09-01", latestAvailableDate: "2026-10-03",
+    coverage: coverage as never, source: "mart.v_ai_product_traffic_daily" });
+
+test("B2-F: empty product period + SOURCE_LAGGING coverage never shows top-level NO_DATA", () => {
+  const cov = pfEnvelope(0, { coverage_status: "SOURCE_LAGGING", watermark_date: "2026-10-04", watermark_at: "t", date_from: "2026-09-01" },
+    "2026-10-05", "2026-10-05");
+  assert.equal(cov.status, "SOURCE_LAGGING");
+  assert.equal(productFunnelStatus(cov.status), "SOURCE_LAGGING");
+  assert.notEqual(productFunnelStatus(cov.status), "NO_DATA");
+});
+
+test("B2-G: empty product period + proven covered CURRENT period -> NO_DATA both places", () => {
+  const cov = pfEnvelope(0, CURRENT_SINCE("2026-09-01"), "2026-10-05", "2026-10-05");
+  assert.equal(cov.status, "NO_DATA");
+  assert.equal(productFunnelStatus(cov.status), "NO_DATA");
+});
+
+test("B2: product_funnel status mapping is one-to-one with coverage", () => {
+  assert.equal(productFunnelStatus("READY"), "API_ACTUAL");
+  for (const s of ["NO_DATA", "SOURCE_LAGGING", "PARTIAL_PERIOD_COVERAGE", "MISSING_SOURCE", "NO_PERMISSION"]) {
+    assert.equal(productFunnelStatus(s), s);
+  }
+});
+
+test("B2: 3de9968 invariant - mart NO_DATA (never loaded) -> MISSING_SOURCE / source_freshness NO_DATA", () => {
+  const e = freshnessEnvelope({ fromDate: "2026-10-06", toDate: "2026-10-06", rowCount: 0, earliestAvailableDate: null,
+    latestAvailableDate: null, coverage: { coverage_status: "NO_DATA", watermark_date: null, watermark_at: null, date_from: null }, source: "x" });
+  assert.deepEqual([e.status, e.source_freshness_status], ["MISSING_SOURCE", "NO_DATA"]);
 });
 
 // --- D5 -------------------------------------------------------------------
