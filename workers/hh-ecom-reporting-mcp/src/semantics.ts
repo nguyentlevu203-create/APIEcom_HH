@@ -157,7 +157,8 @@ export interface FreshnessCoverage {
   watermark_date: string | null;
   watermark_at: string | null;
   // mart.v_ai_source_coverage.date_from = MIN(business_date) ever loaded for
-  // this ingestion domain: the lower bound of the source's proven coverage.
+  // this ingestion domain. Evidence of the first loaded date only: it does
+  // NOT prove that every date after it was successfully ingested.
   date_from: string | null;
 }
 
@@ -165,93 +166,80 @@ export interface FreshnessInput {
   fromDate: string;
   toDate: string;
   rowCount: number;
-  // MIN/MAX(business_date) of the queried view itself (same filter as the tool)
-  earliestAvailableDate: string | null;
-  latestAvailableDate: string | null;
+  // MIN/MAX(business_date) of the queried view itself (same filter as the
+  // tool). Data bounds only - never proof of continuous coverage inside them.
+  firstLoadedDate: string | null;
+  lastLoadedDate: string | null;
   // null = no incremental ingestion domain feeds this view at all
   coverage: FreshnessCoverage | null;
   source: string;
 }
 
+export const COVERAGE_START_BASIS = "FIRST_LOADED_BUSINESS_DATE_CONSERVATIVE_BOUND";
+
 const NOT_ZERO = "An empty result for this period is NOT zero activity.";
 
-/** P14-B2 - a period is "known" only when it lies inside a proven window
- * [lower bound, upper bound]. max(date) alone never proves history before
- * the first loaded date: an empty period before it is unknown, not NO_DATA. */
+/** P14-C - semantic NO_DATA is proven only by an operational watermark:
+ * coverage CURRENT, last successful poll past toDate, and fromDate not
+ * before the evidence start. MIN/MAX loaded dates never prove it - a hole
+ * inside them may simply never have been ingested. Rows without that proof
+ * are real ACTUAL rows but the period stays PARTIAL_PERIOD_COVERAGE. */
 export function freshnessEnvelope(f: FreshnessInput): Row {
-  const earliest = f.earliestAvailableDate;
-  const latest = f.latestAvailableDate;
-  const base = { earliest_available_date: earliest, latest_available_date: latest, source: f.source };
-  const loadedCovers = earliest !== null && latest !== null && f.fromDate >= earliest && f.toDate <= latest;
-  const range = `${earliest ?? "never"}..${latest ?? "never"}`;
+  const first = f.firstLoadedDate;
+  const last = f.lastLoadedDate;
+  const base = { first_loaded_date: first, last_loaded_date: last, source: f.source };
+  const range = `${first ?? "never"}..${last ?? "never"}`;
 
   if (f.coverage === null) {
+    // No incremental watermark: MIN/MAX are informational, no approved
+    // historical coverage contract exists, so nothing here is ever READY or NO_DATA.
     const fresh = { ...base, source_freshness_status: "MISSING_SOURCE" };
-    if (loadedCovers) {
-      return { ...fresh, status: f.rowCount > 0 ? "READY" : "NO_DATA",
-        blocking_reason: f.rowCount > 0 ? null : "Period lies inside the loaded history and returned no rows." };
+    const noWatermark = `No incremental ingestion domain feeds this view; rows are loaded for ${range} ` +
+      "with no continuous-coverage proof.";
+    if (f.rowCount > 0) return { ...fresh, status: "PARTIAL_PERIOD_COVERAGE", blocking_reason: noWatermark };
+    if (first === null || last === null || f.toDate < first) {
+      return { ...fresh, status: "MISSING_SOURCE", blocking_reason: `${noWatermark} Period is before any loaded date. ${NOT_ZERO}` };
     }
-    if (f.rowCount > 0) {
-      return { ...fresh, status: "PARTIAL_PERIOD_COVERAGE",
-        blocking_reason: `No incremental ingestion domain feeds this view; data is loaded only for ${range}.` };
+    if (f.fromDate > last) {
+      return { ...fresh, status: "SOURCE_LAGGING", blocking_reason: `${noWatermark} Period is after the last loaded date. ${NOT_ZERO}` };
     }
-    if (earliest !== null && f.toDate < earliest) {
-      return { ...fresh, status: "MISSING_SOURCE",
-        blocking_reason: `Period predates the loaded history (${range}). ${NOT_ZERO}` };
+    if (f.fromDate >= first && f.toDate <= last) {
+      return { ...fresh, status: "MISSING_SOURCE", blocking_reason: `${noWatermark} Period is a gap inside the loaded range. ${NOT_ZERO}` };
     }
-    if (earliest !== null && f.fromDate < earliest && latest !== null && f.toDate <= latest) {
-      return { ...fresh, status: "PARTIAL_PERIOD_COVERAGE",
-        blocking_reason: `Period starts before the loaded history (${range}). ${NOT_ZERO}` };
-    }
-    return { ...fresh, status: "SOURCE_LAGGING",
-      blocking_reason: `No incremental ingestion domain feeds this view; data is loaded only for ${range}. ${NOT_ZERO}` };
+    return { ...fresh, status: "PARTIAL_PERIOD_COVERAGE", blocking_reason: `${noWatermark} Period crosses the loaded range. ${NOT_ZERO}` };
   }
 
   const cs = f.coverage.coverage_status ?? "MISSING_SOURCE";
-  const lowerBound = f.coverage.date_from;
-  const fresh = { ...base, source_freshness_status: cs, coverage_start_date: lowerBound, watermark_at: f.coverage.watermark_at };
+  const start = f.coverage.date_from;
+  const wm = f.coverage.watermark_date;
+  const fresh = { ...base, source_freshness_status: cs, coverage_evidence_start_date: start,
+    coverage_start_basis: COVERAGE_START_BASIS, watermark_at: f.coverage.watermark_at };
   if (cs === "NO_PERMISSION") {
     return { ...fresh, status: "NO_PERMISSION", blocking_reason: "Source has no API permission." };
   }
-  // A successful poll past toDate proves absence only inside the source's
-  // proven window: never before its first loaded date, never without one.
-  const coveredByPoll = cs === "CURRENT" && f.coverage.watermark_date !== null && f.coverage.watermark_date > f.toDate &&
-    lowerBound !== null && f.fromDate >= lowerBound;
-  const covered = loadedCovers || coveredByPoll;
-  if (f.rowCount > 0) {
-    return { ...fresh, status: covered ? "READY" : "PARTIAL_PERIOD_COVERAGE",
-      blocking_reason: covered ? null : `Source data is proven only for ${lowerBound ?? earliest ?? "never"}..${latest ?? "never"}; ` +
-        "dates outside it are unknown or may still arrive." };
-  }
-  if (covered) {
-    return { ...fresh, status: "NO_DATA",
-      blocking_reason: loadedCovers
-        ? "Period lies inside the loaded history and returned no rows."
-        : `Source is CURRENT, covered since ${lowerBound}, and was polled past the period end (${f.coverage.watermark_at}); ` +
+  const proven = cs === "CURRENT" && wm !== null && wm > f.toDate && start !== null && f.fromDate >= start;
+  if (proven) {
+    return { ...fresh, status: f.rowCount > 0 ? "READY" : "NO_DATA",
+      blocking_reason: f.rowCount > 0 ? null
+        : `Source is CURRENT, evidence starts ${start}, and a successful poll passed the period end (${f.coverage.watermark_at}); ` +
           "no events in this period." };
   }
-  const lb = lowerBound ?? earliest;
-  if (lb !== null && f.toDate < lb) {
-    return { ...fresh, status: "MISSING_SOURCE",
-      blocking_reason: `Period predates the source's proven coverage start (${lb}). ${NOT_ZERO}` };
+  const notProven = `Operational completeness for this period is not proven (source status ${cs}, ` +
+    `watermark ${f.coverage.watermark_at ?? "none"}, evidence start ${start ?? "none"}).`;
+  if (f.rowCount > 0) return { ...fresh, status: "PARTIAL_PERIOD_COVERAGE", blocking_reason: notProven };
+  if (start === null || f.toDate < start) {
+    return { ...fresh, status: "MISSING_SOURCE", blocking_reason: `${notProven} Period is before the evidence start. ${NOT_ZERO}` };
   }
-  if (lb !== null && f.fromDate < lb) {
-    return { ...fresh, status: "PARTIAL_PERIOD_COVERAGE",
-      blocking_reason: `Period starts before the source's proven coverage start (${lb}). ${NOT_ZERO}` };
+  if (f.fromDate < start) {
+    return { ...fresh, status: "PARTIAL_PERIOD_COVERAGE", blocking_reason: `${notProven} Period crosses the evidence start. ${NOT_ZERO}` };
   }
-  if (cs === "CURRENT" && lb === null) {
-    return { ...fresh, status: "MISSING_SOURCE",
-      blocking_reason: `Source is CURRENT but has no loaded date to prove a coverage start. ${NOT_ZERO}` };
-  }
-  // A CURRENT source whose poll already reached into the period: partly known.
-  // One whose poll has not reached the period yet (e.g. AMS T-2 latency): lagging.
-  // mart.v_ai_source_coverage NO_DATA means "nothing ever loaded" — reported as
-  // MISSING_SOURCE here, because this envelope's NO_DATA means "covered, no events".
-  const pollInPeriod = f.coverage.watermark_date !== null && f.coverage.watermark_date >= f.fromDate;
-  const status = cs === "CURRENT" ? (pollInPeriod ? "PARTIAL_PERIOD_COVERAGE" : "SOURCE_LAGGING")
+  // CURRENT whose poll reached into the period: partly known; not yet reached
+  // (e.g. AMS T-2 latency): lagging. MART coverage NO_DATA means "never
+  // loaded" - MISSING_SOURCE here, because this envelope's NO_DATA means
+  // "proven, no events".
+  const status = cs === "CURRENT" ? (wm !== null && wm >= f.fromDate ? "PARTIAL_PERIOD_COVERAGE" : "SOURCE_LAGGING")
     : cs === "NO_DATA" ? "MISSING_SOURCE" : cs;
-  return { ...fresh, status,
-    blocking_reason: `Source data available only through ${latest ?? "never"} (source status ${cs}). ${NOT_ZERO}` };
+  return { ...fresh, status, blocking_reason: `${notProven} ${NOT_ZERO}` };
 }
 
 // ---------------------------------------------------------------------------

@@ -231,20 +231,20 @@ def _cm2_missing_sources(row: dict) -> list[str]:
 def _fetch_freshness(tool_name: str, range_from: str, range_params: tuple,
                      domain: Optional[tuple]) -> tuple:
     """P14-B D4 — one fixed query: the view's MIN/MAX loaded business_date
-    (P14-B2: both bounds) plus that source's mart.v_ai_source_coverage row
-    (date_from = first loaded date of the domain, watermark in ICT).
+    (informational data bounds, never proof of continuous coverage) plus that source's mart.v_ai_source_coverage row
+    (date_from = MIN(business_date) ever loaded = conservative evidence start, watermark in ICT).
     range_from is always a fixed literal FROM/WHERE fragment of this file.
     domain=None means no incremental ingestion domain feeds the view.
-    Returns (earliest, latest, coverage)."""
-    rng = ("SELECT to_char(min(business_date), 'YYYY-MM-DD') AS earliest_available_date, "
-           f"to_char(max(business_date), 'YYYY-MM-DD') AS latest_available_date FROM {range_from}")
+    Returns (first_loaded, last_loaded, coverage)."""
+    rng = ("SELECT to_char(min(business_date), 'YYYY-MM-DD') AS first_loaded_date, "
+           f"to_char(max(business_date), 'YYYY-MM-DD') AS last_loaded_date FROM {range_from}")
     if domain is None:
         rows = _run(tool_name, rng, range_params, {})
         r = rows[0] if rows else {}
-        return r.get("earliest_available_date"), r.get("latest_available_date"), None
+        return r.get("first_loaded_date"), r.get("last_loaded_date"), None
     rows = _run(
         tool_name,
-        "SELECT r.earliest_available_date, r.latest_available_date, c.coverage_status, "
+        "SELECT r.first_loaded_date, r.last_loaded_date, c.coverage_status, "
         "to_char(c.date_from, 'YYYY-MM-DD') AS coverage_date_from, "
         "to_char(c.last_success_at AT TIME ZONE 'Asia/Ho_Chi_Minh', 'YYYY-MM-DD\"T\"HH24:MI:SS\"+07:00\"') AS watermark_at, "
         "to_char((c.last_success_at AT TIME ZONE 'Asia/Ho_Chi_Minh')::date, 'YYYY-MM-DD') AS watermark_date "
@@ -252,7 +252,7 @@ def _fetch_freshness(tool_name: str, range_from: str, range_params: tuple,
         range_params + domain, {},
     )
     r = rows[0] if rows else {}
-    return r.get("earliest_available_date"), r.get("latest_available_date"), {
+    return r.get("first_loaded_date"), r.get("last_loaded_date"), {
         "coverage_status": r.get("coverage_status"),
         "watermark_date": r.get("watermark_date"),
         "watermark_at": r.get("watermark_at"),
@@ -470,7 +470,7 @@ def get_video_performance(from_date: str, to_date: str, platform: str,
 
     if platform != "TIKTOK":
         return {"rows": [], "row_count": 0, "platform": platform,
-                "coverage": {"status": "MISSING_SOURCE", "earliest_available_date": None, "latest_available_date": None,
+                "coverage": {"status": "MISSING_SOURCE", "first_loaded_date": None, "last_loaded_date": None,
                              "source_freshness_status": "MISSING_SOURCE", "source": None,
                              "blocking_reason": "No Shopee video-grain source is wired into the approved mart layer."},
                 "note": "Video-grain performance is only proven for TIKTOK this phase."}
@@ -494,15 +494,15 @@ def get_video_performance(from_date: str, to_date: str, platform: str,
                  "account_type": account_type, "limit": limit})
 
     if account_type:
-        earliest, latest, cov = _fetch_freshness(
+        first, last, cov = _fetch_freshness(
             "get_video_performance_freshness",
             "mart.v_ai_video_daily WHERE channel = 'TIKTOK' AND account_type = %s", (account_type,), None)
     else:
-        earliest, latest, cov = _fetch_freshness(
+        first, last, cov = _fetch_freshness(
             "get_video_performance_freshness",
             "mart.v_ai_video_daily WHERE channel = 'TIKTOK'",
             (), None)
-    coverage = freshness_envelope(from_date, to_date, len(rows), earliest, latest, cov, "mart.v_ai_video_daily")
+    coverage = freshness_envelope(from_date, to_date, len(rows), first, last, cov, "mart.v_ai_video_daily")
 
     out = [{
         "video_id": r["video_id"], "business_date": r["business_date"], "account_type": r["account_type"],
@@ -543,10 +543,10 @@ def get_live_performance(from_date: str, to_date: str, account_type: Optional[st
     rows = _run("get_live_performance", sql, params,
                 {"from_date": from_date, "to_date": to_date, "account_type": account_type, "limit": limit})
 
-    earliest, latest, cov = _fetch_freshness(
+    first, last, cov = _fetch_freshness(
         "get_live_performance_freshness",
         "mart.v_ai_live_daily WHERE channel = 'TIKTOK' AND account_type = %s", (account_type,), ("TIKTOK", "live"))
-    coverage = freshness_envelope(from_date, to_date, len(rows), earliest, latest, cov, "mart.v_ai_live_daily")
+    coverage = freshness_envelope(from_date, to_date, len(rows), first, last, cov, "mart.v_ai_live_daily")
 
     out = [{
         "live_id": r["live_id"], "business_date": r["business_date"], "account_type": r["account_type"],
@@ -579,7 +579,7 @@ def get_affiliate_performance(from_date: str, to_date: str, platform: str, limit
     if platform != "SHOPEE":
         return {
             "rows": [], "row_count": 0, "platform": platform,
-            "coverage": {"status": "MISSING_SOURCE", "earliest_available_date": None, "latest_available_date": None,
+            "coverage": {"status": "MISSING_SOURCE", "first_loaded_date": None, "last_loaded_date": None,
                          "source_freshness_status": "MISSING_SOURCE", "source": None,
                          "blocking_reason": "No dedicated TikTok affiliate creator view exists; see the routing note."},
             "note": "No dedicated TikTok affiliate creator/channel view exists in the approved mart "
@@ -601,10 +601,10 @@ def get_affiliate_performance(from_date: str, to_date: str, platform: str, limit
     rows = _run("get_affiliate_performance", sql, params,
                 {"from_date": from_date, "to_date": to_date, "platform": platform, "limit": limit})
 
-    earliest, latest, cov = _fetch_freshness(
+    first, last, cov = _fetch_freshness(
         "get_affiliate_performance_freshness",
         "mart.v_ai_affiliate_creator_daily WHERE channel = 'SHOPEE'", (), ("SHOPEE", "affiliate_ams"))
-    coverage = freshness_envelope(from_date, to_date, len(rows), earliest, latest, cov, "mart.v_ai_affiliate_creator_daily")
+    coverage = freshness_envelope(from_date, to_date, len(rows), first, last, cov, "mart.v_ai_affiliate_creator_daily")
 
     out = [{
         "affiliate": r["affiliate_name"] or r["affiliate_username"], "business_date": r["business_date"],

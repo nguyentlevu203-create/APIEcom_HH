@@ -1,61 +1,558 @@
 {
-  "_note": "P14-B/P14-B2 shared cases: the Worker (semantics.ts) and the Python reference (reporting_semantics.py) must give identical results.",
-  "cost_line": [
-    {"args": ["TIKTOK", "payment_fee", 0, "SOURCE_LAGGING"], "amount": null, "status": "SOURCE_LAGGING"},
-    {"args": ["TIKTOK", "fixed_fee", null, "NOT_SETTLED_YET"], "amount": null, "status": "NOT_SETTLED_YET"},
-    {"args": ["TIKTOK", "infrastructure_fee", 0, "COMPLETE_SETTLEMENT_COVERAGE"], "amount": 0, "status": "READY"},
-    {"args": ["TIKTOK", "fixed_fee", 1341230, "COMPLETE_SETTLEMENT_COVERAGE"], "amount": 1341230, "status": "READY"},
-    {"args": ["TIKTOK", "vxp_fee", 42, "PARTIAL_SETTLEMENT_COVERAGE"], "amount": 42, "status": "PARTIAL_SETTLEMENT_COVERAGE"},
-    {"args": ["TIKTOK", "affiliate_fee", 7, null], "amount": 7, "status": "SETTLEMENT_COVERAGE_UNKNOWN"},
-    {"args": ["TIKTOK", "hh_internal_packaging_cost", 0, "SOURCE_LAGGING"], "amount": 0, "status": "READY"},
-    {"args": ["TIKTOK", "ads_spend", null, "SOURCE_LAGGING"], "amount": null, "status": "SEPARATE_API_REQUIRED"},
-    {"args": ["SHOPEE", "fixed_fee", 806405, "READY"], "amount": 806405, "status": "READY"},
-    {"args": ["SHOPEE", "vxp_fee", null, "READY"], "amount": null, "status": "MISSING_SOURCE"}
+ "_note": "P14-B/B2/C shared cases: the Worker (semantics.ts) and the Python reference (reporting_semantics.py) must give identical results. P14-C: MIN/MAX loaded dates never prove NO_DATA; only CURRENT + watermark past to_date + from_date >= evidence start does.",
+ "cost_line": [
+  {
+   "args": [
+    "TIKTOK",
+    "payment_fee",
+    0,
+    "SOURCE_LAGGING"
+   ],
+   "amount": null,
+   "status": "SOURCE_LAGGING"
+  },
+  {
+   "args": [
+    "TIKTOK",
+    "fixed_fee",
+    null,
+    "NOT_SETTLED_YET"
+   ],
+   "amount": null,
+   "status": "NOT_SETTLED_YET"
+  },
+  {
+   "args": [
+    "TIKTOK",
+    "infrastructure_fee",
+    0,
+    "COMPLETE_SETTLEMENT_COVERAGE"
+   ],
+   "amount": 0,
+   "status": "READY"
+  },
+  {
+   "args": [
+    "TIKTOK",
+    "fixed_fee",
+    1341230,
+    "COMPLETE_SETTLEMENT_COVERAGE"
+   ],
+   "amount": 1341230,
+   "status": "READY"
+  },
+  {
+   "args": [
+    "TIKTOK",
+    "vxp_fee",
+    42,
+    "PARTIAL_SETTLEMENT_COVERAGE"
+   ],
+   "amount": 42,
+   "status": "PARTIAL_SETTLEMENT_COVERAGE"
+  },
+  {
+   "args": [
+    "TIKTOK",
+    "affiliate_fee",
+    7,
+    null
+   ],
+   "amount": 7,
+   "status": "SETTLEMENT_COVERAGE_UNKNOWN"
+  },
+  {
+   "args": [
+    "TIKTOK",
+    "hh_internal_packaging_cost",
+    0,
+    "SOURCE_LAGGING"
+   ],
+   "amount": 0,
+   "status": "READY"
+  },
+  {
+   "args": [
+    "TIKTOK",
+    "ads_spend",
+    null,
+    "SOURCE_LAGGING"
+   ],
+   "amount": null,
+   "status": "SEPARATE_API_REQUIRED"
+  },
+  {
+   "args": [
+    "SHOPEE",
+    "fixed_fee",
+    806405,
+    "READY"
+   ],
+   "amount": 806405,
+   "status": "READY"
+  },
+  {
+   "args": [
+    "SHOPEE",
+    "vxp_fee",
+    null,
+    "READY"
+   ],
+   "amount": null,
+   "status": "MISSING_SOURCE"
+  }
+ ],
+ "cogs": [
+  {
+   "args": [
+    880767.38,
+    880767.38,
+    0,
+    "COGS_INCOMPLETE",
+    "COGS_INCOMPLETE"
+   ],
+   "value": 880767.38,
+   "status": "COGS_INCOMPLETE"
+  },
+  {
+   "args": [
+    100,
+    100,
+    0,
+    "READY",
+    "COGS_INCOMPLETE"
+   ],
+   "value": 100,
+   "status": "COGS_INCOMPLETE"
+  },
+  {
+   "args": [
+    100,
+    90,
+    10,
+    "READY",
+    "READY"
+   ],
+   "value": 100,
+   "status": "READY"
+  },
+  {
+   "args": [
+    0,
+    null,
+    null,
+    null,
+    null
+   ],
+   "value": null,
+   "status": "MISSING_SOURCE"
+  }
+ ],
+ "freshness": [
+  {
+   "case": "A incremental SOURCE_LAGGING, hole inside MIN..MAX, empty -> not NO_DATA",
+   "in": {
+    "fromDate": "2026-09-05",
+    "toDate": "2026-09-05",
+    "rowCount": 0,
+    "firstLoadedDate": "2026-09-01",
+    "lastLoadedDate": "2026-09-12",
+    "coverage": {
+     "coverage_status": "SOURCE_LAGGING",
+     "watermark_date": "2026-10-06",
+     "watermark_at": "2026-10-06T08:00:00+07:00",
+     "date_from": "2026-09-01"
+    }
+   },
+   "status": "SOURCE_LAGGING",
+   "source_freshness_status": "SOURCE_LAGGING"
+  },
+  {
+   "case": "B same source, rows -> PARTIAL (rows real, completeness unproven)",
+   "in": {
+    "fromDate": "2026-09-05",
+    "toDate": "2026-09-05",
+    "rowCount": 3,
+    "firstLoadedDate": "2026-09-01",
+    "lastLoadedDate": "2026-09-12",
+    "coverage": {
+     "coverage_status": "SOURCE_LAGGING",
+     "watermark_date": "2026-10-06",
+     "watermark_at": "2026-10-06T08:00:00+07:00",
+     "date_from": "2026-09-01"
+    }
+   },
+   "status": "PARTIAL_PERIOD_COVERAGE",
+   "source_freshness_status": "SOURCE_LAGGING"
+  },
+  {
+   "case": "C no incremental domain, hole inside MIN..MAX, empty -> MISSING_SOURCE",
+   "in": {
+    "fromDate": "2026-09-05",
+    "toDate": "2026-09-05",
+    "rowCount": 0,
+    "firstLoadedDate": "2026-09-01",
+    "lastLoadedDate": "2026-09-12",
+    "coverage": null
+   },
+   "status": "MISSING_SOURCE",
+   "source_freshness_status": "MISSING_SOURCE"
+  },
+  {
+   "case": "D no incremental domain, rows inside MIN..MAX -> PARTIAL",
+   "in": {
+    "fromDate": "2026-09-05",
+    "toDate": "2026-09-05",
+    "rowCount": 2,
+    "firstLoadedDate": "2026-09-01",
+    "lastLoadedDate": "2026-09-12",
+    "coverage": null
+   },
+   "status": "PARTIAL_PERIOD_COVERAGE",
+   "source_freshness_status": "MISSING_SOURCE"
+  },
+  {
+   "case": "E CURRENT, start<=from, watermark>to, empty -> NO_DATA",
+   "in": {
+    "fromDate": "2026-10-05",
+    "toDate": "2026-10-05",
+    "rowCount": 0,
+    "firstLoadedDate": "2026-09-03",
+    "lastLoadedDate": "2026-10-03",
+    "coverage": {
+     "coverage_status": "CURRENT",
+     "watermark_date": "2026-10-06",
+     "watermark_at": "2026-10-06T08:00:00+07:00",
+     "date_from": "2026-09-01"
+    }
+   },
+   "status": "NO_DATA",
+   "source_freshness_status": "CURRENT"
+  },
+  {
+   "case": "E' CURRENT, start<=from, watermark>to, rows -> READY",
+   "in": {
+    "fromDate": "2026-10-01",
+    "toDate": "2026-10-05",
+    "rowCount": 9,
+    "firstLoadedDate": "2026-09-03",
+    "lastLoadedDate": "2026-10-03",
+    "coverage": {
+     "coverage_status": "CURRENT",
+     "watermark_date": "2026-10-06",
+     "watermark_at": "2026-10-06T08:00:00+07:00",
+     "date_from": "2026-09-01"
+    }
+   },
+   "status": "READY",
+   "source_freshness_status": "CURRENT"
+  },
+  {
+   "case": "F CURRENT, watermark reached into but not past to, empty -> PARTIAL",
+   "in": {
+    "fromDate": "2026-10-06",
+    "toDate": "2026-10-06",
+    "rowCount": 0,
+    "firstLoadedDate": "2026-09-01",
+    "lastLoadedDate": "2026-10-05",
+    "coverage": {
+     "coverage_status": "CURRENT",
+     "watermark_date": "2026-10-06",
+     "watermark_at": "2026-10-06T08:00:00+07:00",
+     "date_from": "2026-09-01"
+    }
+   },
+   "status": "PARTIAL_PERIOD_COVERAGE",
+   "source_freshness_status": "CURRENT"
+  },
+  {
+   "case": "F CURRENT, watermark before from (AMS T-2), empty -> SOURCE_LAGGING",
+   "in": {
+    "fromDate": "2026-10-06",
+    "toDate": "2026-10-06",
+    "rowCount": 0,
+    "firstLoadedDate": "2026-09-01",
+    "lastLoadedDate": "2026-10-04",
+    "coverage": {
+     "coverage_status": "CURRENT",
+     "watermark_date": "2026-10-04",
+     "watermark_at": "2026-10-04T08:00:00+07:00",
+     "date_from": "2026-09-01"
+    }
+   },
+   "status": "SOURCE_LAGGING",
+   "source_freshness_status": "CURRENT"
+  },
+  {
+   "case": "F CURRENT, watermark not past to, rows -> PARTIAL",
+   "in": {
+    "fromDate": "2026-10-01",
+    "toDate": "2026-10-06",
+    "rowCount": 5,
+    "firstLoadedDate": "2026-09-01",
+    "lastLoadedDate": "2026-10-05",
+    "coverage": {
+     "coverage_status": "CURRENT",
+     "watermark_date": "2026-10-06",
+     "watermark_at": "2026-10-06T08:00:00+07:00",
+     "date_from": "2026-09-01"
+    }
+   },
+   "status": "PARTIAL_PERIOD_COVERAGE",
+   "source_freshness_status": "CURRENT"
+  },
+  {
+   "case": "G incremental: period before evidence start -> MISSING_SOURCE",
+   "in": {
+    "fromDate": "2026-08-20",
+    "toDate": "2026-08-25",
+    "rowCount": 0,
+    "firstLoadedDate": "2026-09-01",
+    "lastLoadedDate": "2026-10-03",
+    "coverage": {
+     "coverage_status": "CURRENT",
+     "watermark_date": "2026-10-06",
+     "watermark_at": "2026-10-06T08:00:00+07:00",
+     "date_from": "2026-09-01"
+    }
+   },
+   "status": "MISSING_SOURCE",
+   "source_freshness_status": "CURRENT"
+  },
+  {
+   "case": "G static: period before first loaded date -> MISSING_SOURCE",
+   "in": {
+    "fromDate": "2026-08-20",
+    "toDate": "2026-08-25",
+    "rowCount": 0,
+    "firstLoadedDate": "2026-09-01",
+    "lastLoadedDate": "2026-09-12",
+    "coverage": null
+   },
+   "status": "MISSING_SOURCE",
+   "source_freshness_status": "MISSING_SOURCE"
+  },
+  {
+   "case": "H incremental: period crosses evidence start, empty -> PARTIAL",
+   "in": {
+    "fromDate": "2026-08-30",
+    "toDate": "2026-09-05",
+    "rowCount": 0,
+    "firstLoadedDate": "2026-09-01",
+    "lastLoadedDate": "2026-10-03",
+    "coverage": {
+     "coverage_status": "CURRENT",
+     "watermark_date": "2026-10-06",
+     "watermark_at": "2026-10-06T08:00:00+07:00",
+     "date_from": "2026-09-01"
+    }
+   },
+   "status": "PARTIAL_PERIOD_COVERAGE",
+   "source_freshness_status": "CURRENT"
+  },
+  {
+   "case": "H incremental: period crosses evidence start, rows -> PARTIAL",
+   "in": {
+    "fromDate": "2026-08-30",
+    "toDate": "2026-09-05",
+    "rowCount": 4,
+    "firstLoadedDate": "2026-09-01",
+    "lastLoadedDate": "2026-10-03",
+    "coverage": {
+     "coverage_status": "CURRENT",
+     "watermark_date": "2026-10-06",
+     "watermark_at": "2026-10-06T08:00:00+07:00",
+     "date_from": "2026-09-01"
+    }
+   },
+   "status": "PARTIAL_PERIOD_COVERAGE",
+   "source_freshness_status": "CURRENT"
+  },
+  {
+   "case": "H static: period crosses first loaded date, empty -> PARTIAL",
+   "in": {
+    "fromDate": "2026-08-30",
+    "toDate": "2026-09-05",
+    "rowCount": 0,
+    "firstLoadedDate": "2026-09-01",
+    "lastLoadedDate": "2026-09-12",
+    "coverage": null
+   },
+   "status": "PARTIAL_PERIOD_COVERAGE",
+   "source_freshness_status": "MISSING_SOURCE"
+  },
+  {
+   "case": "H static: period crosses last loaded date, empty -> PARTIAL",
+   "in": {
+    "fromDate": "2026-09-10",
+    "toDate": "2026-09-15",
+    "rowCount": 0,
+    "firstLoadedDate": "2026-09-01",
+    "lastLoadedDate": "2026-09-12",
+    "coverage": null
+   },
+   "status": "PARTIAL_PERIOD_COVERAGE",
+   "source_freshness_status": "MISSING_SOURCE"
+  },
+  {
+   "case": "I MART coverage NO_DATA (never loaded) -> MISSING_SOURCE",
+   "in": {
+    "fromDate": "2026-10-06",
+    "toDate": "2026-10-06",
+    "rowCount": 0,
+    "firstLoadedDate": null,
+    "lastLoadedDate": null,
+    "coverage": {
+     "coverage_status": "NO_DATA",
+     "watermark_date": null,
+     "watermark_at": null,
+     "date_from": null
+    }
+   },
+   "status": "MISSING_SOURCE",
+   "source_freshness_status": "NO_DATA"
+  },
+  {
+   "case": "static: period after last loaded date (video stops 09-12) -> SOURCE_LAGGING",
+   "in": {
+    "fromDate": "2026-10-06",
+    "toDate": "2026-10-06",
+    "rowCount": 0,
+    "firstLoadedDate": "2026-09-01",
+    "lastLoadedDate": "2026-09-12",
+    "coverage": null
+   },
+   "status": "SOURCE_LAGGING",
+   "source_freshness_status": "MISSING_SOURCE"
+  },
+  {
+   "case": "static: never loaded -> MISSING_SOURCE",
+   "in": {
+    "fromDate": "2026-10-06",
+    "toDate": "2026-10-06",
+    "rowCount": 0,
+    "firstLoadedDate": null,
+    "lastLoadedDate": null,
+    "coverage": null
+   },
+   "status": "MISSING_SOURCE",
+   "source_freshness_status": "MISSING_SOURCE"
+  },
+  {
+   "case": "NO_PERMISSION stays NO_PERMISSION",
+   "in": {
+    "fromDate": "2026-10-06",
+    "toDate": "2026-10-06",
+    "rowCount": 0,
+    "firstLoadedDate": null,
+    "lastLoadedDate": null,
+    "coverage": {
+     "coverage_status": "NO_PERMISSION",
+     "watermark_date": null,
+     "watermark_at": null,
+     "date_from": null
+    }
+   },
+   "status": "NO_PERMISSION",
+   "source_freshness_status": "NO_PERMISSION"
+  },
+  {
+   "case": "CURRENT polled past with no evidence start -> MISSING_SOURCE",
+   "in": {
+    "fromDate": "2026-10-05",
+    "toDate": "2026-10-05",
+    "rowCount": 0,
+    "firstLoadedDate": null,
+    "lastLoadedDate": null,
+    "coverage": {
+     "coverage_status": "CURRENT",
+     "watermark_date": "2026-10-06",
+     "watermark_at": "2026-10-06T08:00:00+07:00",
+     "date_from": null
+    }
+   },
+   "status": "MISSING_SOURCE",
+   "source_freshness_status": "CURRENT"
+  },
+  {
+   "case": "SOURCE_LAGGING, period past last loaded date, rows -> PARTIAL",
+   "in": {
+    "fromDate": "2026-10-01",
+    "toDate": "2026-10-06",
+    "rowCount": 12,
+    "firstLoadedDate": "2026-09-01",
+    "lastLoadedDate": "2026-10-04",
+    "coverage": {
+     "coverage_status": "SOURCE_LAGGING",
+     "watermark_date": "2026-10-06",
+     "watermark_at": "2026-10-06T08:00:00+07:00",
+     "date_from": "2026-09-01"
+    }
+   },
+   "status": "PARTIAL_PERIOD_COVERAGE",
+   "source_freshness_status": "SOURCE_LAGGING"
+  },
+  {
+   "case": "SOURCE_LAGGING inside MIN..MAX with watermark past to, empty -> never NO_DATA",
+   "in": {
+    "fromDate": "2026-09-30",
+    "toDate": "2026-09-30",
+    "rowCount": 0,
+    "firstLoadedDate": "2026-09-01",
+    "lastLoadedDate": "2026-10-04",
+    "coverage": {
+     "coverage_status": "SOURCE_LAGGING",
+     "watermark_date": "2026-10-06",
+     "watermark_at": "2026-10-06T08:00:00+07:00",
+     "date_from": "2026-09-01"
+    }
+   },
+   "status": "SOURCE_LAGGING",
+   "source_freshness_status": "SOURCE_LAGGING"
+  },
+  {
+   "case": "LAST_RUN_FAILED passes through, empty",
+   "in": {
+    "fromDate": "2026-10-05",
+    "toDate": "2026-10-05",
+    "rowCount": 0,
+    "firstLoadedDate": "2026-09-01",
+    "lastLoadedDate": "2026-10-04",
+    "coverage": {
+     "coverage_status": "LAST_RUN_FAILED",
+     "watermark_date": "2026-10-06",
+     "watermark_at": "2026-10-06T08:00:00+07:00",
+     "date_from": "2026-09-01"
+    }
+   },
+   "status": "LAST_RUN_FAILED",
+   "source_freshness_status": "LAST_RUN_FAILED"
+  }
+ ],
+ "product_funnel": [
+  [
+   "READY",
+   "API_ACTUAL"
   ],
-  "cogs": [
-    {"args": [880767.38, 880767.38, 0, "COGS_INCOMPLETE", "COGS_INCOMPLETE"], "value": 880767.38, "status": "COGS_INCOMPLETE"},
-    {"args": [100, 100, 0, "READY", "COGS_INCOMPLETE"], "value": 100, "status": "COGS_INCOMPLETE"},
-    {"args": [100, 90, 10, "READY", "READY"], "value": 100, "status": "READY"},
-    {"args": [0, null, null, null, null], "value": null, "status": "MISSING_SOURCE"}
+  [
+   "NO_DATA",
+   "NO_DATA"
   ],
-  "freshness": [
-    {"in": {"fromDate": "2026-10-06", "toDate": "2026-10-06", "rowCount": 0, "earliestAvailableDate": "2026-09-01", "latestAvailableDate": "2026-09-12", "coverage": null},
-     "status": "SOURCE_LAGGING", "source_freshness_status": "MISSING_SOURCE"},
-    {"in": {"fromDate": "2026-09-10", "toDate": "2026-09-10", "rowCount": 2, "earliestAvailableDate": "2026-09-01", "latestAvailableDate": "2026-09-12", "coverage": null},
-     "status": "READY", "source_freshness_status": "MISSING_SOURCE"},
-    {"in": {"fromDate": "2026-10-05", "toDate": "2026-10-05", "rowCount": 0, "earliestAvailableDate": "2026-09-01", "latestAvailableDate": "2026-10-03", "coverage": {"coverage_status": "CURRENT", "watermark_date": "2026-10-06", "watermark_at": "w", "date_from": "2026-09-01"}},
-     "status": "NO_DATA", "source_freshness_status": "CURRENT"},
-    {"in": {"fromDate": "2026-10-06", "toDate": "2026-10-06", "rowCount": 0, "earliestAvailableDate": "2026-09-01", "latestAvailableDate": "2026-10-05", "coverage": {"coverage_status": "CURRENT", "watermark_date": "2026-10-06", "watermark_at": "w", "date_from": "2026-09-01"}},
-     "status": "PARTIAL_PERIOD_COVERAGE", "source_freshness_status": "CURRENT"},
-    {"in": {"fromDate": "2026-10-06", "toDate": "2026-10-06", "rowCount": 0, "earliestAvailableDate": "2026-09-01", "latestAvailableDate": "2026-10-04", "coverage": {"coverage_status": "CURRENT", "watermark_date": "2026-10-04", "watermark_at": "w", "date_from": "2026-09-01"}},
-     "status": "SOURCE_LAGGING", "source_freshness_status": "CURRENT"},
-    {"in": {"fromDate": "2026-10-06", "toDate": "2026-10-06", "rowCount": 0, "earliestAvailableDate": "2026-09-01", "latestAvailableDate": "2026-10-04", "coverage": {"coverage_status": "SOURCE_LAGGING", "watermark_date": "2026-10-06", "watermark_at": "w", "date_from": "2026-09-01"}},
-     "status": "SOURCE_LAGGING", "source_freshness_status": "SOURCE_LAGGING"},
-    {"in": {"fromDate": "2026-09-30", "toDate": "2026-09-30", "rowCount": 0, "earliestAvailableDate": "2026-09-01", "latestAvailableDate": "2026-10-04", "coverage": {"coverage_status": "SOURCE_LAGGING", "watermark_date": "2026-10-06", "watermark_at": "w", "date_from": "2026-09-01"}},
-     "status": "NO_DATA", "source_freshness_status": "SOURCE_LAGGING"},
-    {"in": {"fromDate": "2026-10-01", "toDate": "2026-10-06", "rowCount": 12, "earliestAvailableDate": "2026-09-01", "latestAvailableDate": "2026-10-04", "coverage": {"coverage_status": "SOURCE_LAGGING", "watermark_date": "2026-10-06", "watermark_at": "w", "date_from": "2026-09-01"}},
-     "status": "PARTIAL_PERIOD_COVERAGE", "source_freshness_status": "SOURCE_LAGGING"},
-    {"in": {"fromDate": "2026-10-06", "toDate": "2026-10-06", "rowCount": 0, "earliestAvailableDate": null, "latestAvailableDate": null, "coverage": {"coverage_status": "NO_PERMISSION", "watermark_date": null, "watermark_at": null, "date_from": null}},
-     "status": "NO_PERMISSION", "source_freshness_status": "NO_PERMISSION"},
-    {"in": {"fromDate": "2026-10-06", "toDate": "2026-10-06", "rowCount": 0, "earliestAvailableDate": null, "latestAvailableDate": null, "coverage": {"coverage_status": "NO_DATA", "watermark_date": null, "watermark_at": null, "date_from": null}},
-     "status": "MISSING_SOURCE", "source_freshness_status": "NO_DATA"},
-    {"case": "A static: period before first loaded date, empty", "in": {"fromDate": "2026-08-20", "toDate": "2026-08-25", "rowCount": 0, "earliestAvailableDate": "2026-09-01", "latestAvailableDate": "2026-09-12", "coverage": null},
-     "status": "MISSING_SOURCE", "source_freshness_status": "MISSING_SOURCE"},
-    {"case": "B static: period inside loaded history, empty", "in": {"fromDate": "2026-09-05", "toDate": "2026-09-05", "rowCount": 0, "earliestAvailableDate": "2026-09-01", "latestAvailableDate": "2026-09-12", "coverage": null},
-     "status": "NO_DATA", "source_freshness_status": "MISSING_SOURCE"},
-    {"case": "C static: period overlaps lower bound, empty", "in": {"fromDate": "2026-08-30", "toDate": "2026-09-05", "rowCount": 0, "earliestAvailableDate": "2026-09-01", "latestAvailableDate": "2026-09-12", "coverage": null},
-     "status": "PARTIAL_PERIOD_COVERAGE", "source_freshness_status": "MISSING_SOURCE"},
-    {"case": "C static: period overlaps lower bound, rows", "in": {"fromDate": "2026-08-30", "toDate": "2026-09-05", "rowCount": 3, "earliestAvailableDate": "2026-09-01", "latestAvailableDate": "2026-09-12", "coverage": null},
-     "status": "PARTIAL_PERIOD_COVERAGE", "source_freshness_status": "MISSING_SOURCE"},
-    {"case": "D current sparse: polled past, inside proven window, empty", "in": {"fromDate": "2026-10-05", "toDate": "2026-10-05", "rowCount": 0, "earliestAvailableDate": "2026-09-03", "latestAvailableDate": "2026-10-03", "coverage": {"coverage_status": "CURRENT", "watermark_date": "2026-10-06", "watermark_at": "w", "date_from": "2026-09-01"}},
-     "status": "NO_DATA", "source_freshness_status": "CURRENT"},
-    {"case": "E current: polled past, period predates coverage start", "in": {"fromDate": "2026-08-20", "toDate": "2026-08-25", "rowCount": 0, "earliestAvailableDate": "2026-09-01", "latestAvailableDate": "2026-10-03", "coverage": {"coverage_status": "CURRENT", "watermark_date": "2026-10-06", "watermark_at": "w", "date_from": "2026-09-01"}},
-     "status": "MISSING_SOURCE", "source_freshness_status": "CURRENT"},
-    {"case": "E current: polled past, period overlaps coverage start", "in": {"fromDate": "2026-08-30", "toDate": "2026-09-05", "rowCount": 0, "earliestAvailableDate": "2026-09-01", "latestAvailableDate": "2026-10-03", "coverage": {"coverage_status": "CURRENT", "watermark_date": "2026-10-06", "watermark_at": "w", "date_from": "2026-09-01"}},
-     "status": "PARTIAL_PERIOD_COVERAGE", "source_freshness_status": "CURRENT"},
-    {"case": "E current: polled past, overlap with rows is not READY", "in": {"fromDate": "2026-08-30", "toDate": "2026-09-05", "rowCount": 4, "earliestAvailableDate": "2026-09-01", "latestAvailableDate": "2026-10-03", "coverage": {"coverage_status": "CURRENT", "watermark_date": "2026-10-06", "watermark_at": "w", "date_from": "2026-09-01"}},
-     "status": "PARTIAL_PERIOD_COVERAGE", "source_freshness_status": "CURRENT"},
-    {"case": "E current: polled past, no provable coverage start", "in": {"fromDate": "2026-10-05", "toDate": "2026-10-05", "rowCount": 0, "earliestAvailableDate": null, "latestAvailableDate": null, "coverage": {"coverage_status": "CURRENT", "watermark_date": "2026-10-06", "watermark_at": "w", "date_from": null}},
-     "status": "MISSING_SOURCE", "source_freshness_status": "CURRENT"}
+  [
+   "SOURCE_LAGGING",
+   "SOURCE_LAGGING"
+  ],
+  [
+   "PARTIAL_PERIOD_COVERAGE",
+   "PARTIAL_PERIOD_COVERAGE"
+  ],
+  [
+   "MISSING_SOURCE",
+   "MISSING_SOURCE"
+  ],
+  [
+   "NO_PERMISSION",
+   "NO_PERMISSION"
   ]
+ ]
 }

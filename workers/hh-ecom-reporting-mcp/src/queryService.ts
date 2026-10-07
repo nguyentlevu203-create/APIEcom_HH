@@ -52,36 +52,36 @@ function cm2MissingSources(row: Row): string[] {
 
 // ---------------------------------------------------------------------------
 // P14-B D4 — freshness envelope for event-grain results. One fixed query:
-// the view's own MIN/MAX loaded business_date (P14-B2: both bounds, so a
-// period before the first loaded date is never read as covered) + that
-// source's row in mart.v_ai_source_coverage (coverage_status, date_from =
-// first loaded date of the domain, last successful watermark in ICT like
-// business_date). domain=null means no incremental ingestion domain feeds
+// the view's own MIN/MAX loaded business_date (informational data bounds,
+// never proof of continuous coverage) + that source's row in
+// mart.v_ai_source_coverage (coverage_status, date_from = MIN(business_date)
+// ever loaded = conservative evidence start, last successful watermark in
+// ICT like business_date). domain=null means no incremental ingestion domain feeds
 // the view. rangeFrom is always a fixed literal FROM/WHERE fragment of this
 // file; only its $n params vary. See semantics.freshnessEnvelope for rules.
 // ---------------------------------------------------------------------------
 
-type Freshness = Pick<FreshnessInput, "earliestAvailableDate" | "latestAvailableDate" | "coverage">;
+type Freshness = Pick<FreshnessInput, "firstLoadedDate" | "lastLoadedDate" | "coverage">;
 
 async function fetchFreshness(
   env: Env, log: Logger, toolName: string,
   rangeFrom: string, rangeParams: unknown[], domain: [string, string] | null
 ): Promise<Freshness> {
-  const range = "SELECT to_char(min(business_date), 'YYYY-MM-DD') AS earliest_available_date, " +
-    `to_char(max(business_date), 'YYYY-MM-DD') AS latest_available_date FROM ${rangeFrom}`;
+  const range = "SELECT to_char(min(business_date), 'YYYY-MM-DD') AS first_loaded_date, " +
+    `to_char(max(business_date), 'YYYY-MM-DD') AS last_loaded_date FROM ${rangeFrom}`;
   if (domain === null) {
     const rows = await runQuery(env, toolName, range, rangeParams, {}, log);
     const r = rows[0] ?? {};
     return {
-      earliestAvailableDate: (r.earliest_available_date as string | null) ?? null,
-      latestAvailableDate: (r.latest_available_date as string | null) ?? null,
+      firstLoadedDate: (r.first_loaded_date as string | null) ?? null,
+      lastLoadedDate: (r.last_loaded_date as string | null) ?? null,
       coverage: null,
     };
   }
   const n = rangeParams.length;
   const rows = await runQuery(
     env, toolName,
-    "SELECT r.earliest_available_date, r.latest_available_date, c.coverage_status, " +
+    "SELECT r.first_loaded_date, r.last_loaded_date, c.coverage_status, " +
       "to_char(c.date_from, 'YYYY-MM-DD') AS coverage_date_from, " +
       "to_char(c.last_success_at AT TIME ZONE 'Asia/Ho_Chi_Minh', 'YYYY-MM-DD\"T\"HH24:MI:SS\"+07:00\"') AS watermark_at, " +
       "to_char((c.last_success_at AT TIME ZONE 'Asia/Ho_Chi_Minh')::date, 'YYYY-MM-DD') AS watermark_date " +
@@ -90,8 +90,8 @@ async function fetchFreshness(
   );
   const r = rows[0] ?? {};
   return {
-    earliestAvailableDate: (r.earliest_available_date as string | null) ?? null,
-    latestAvailableDate: (r.latest_available_date as string | null) ?? null,
+    firstLoadedDate: (r.first_loaded_date as string | null) ?? null,
+    lastLoadedDate: (r.last_loaded_date as string | null) ?? null,
     coverage: {
       coverage_status: (r.coverage_status as string | null) ?? null,
       watermark_date: (r.watermark_date as string | null) ?? null,
@@ -644,7 +644,7 @@ export async function getVideoPerformance(
   if (platform !== "TIKTOK") {
     return {
       rows: [], row_count: 0, platform,
-      coverage: { status: "MISSING_SOURCE", earliest_available_date: null, latest_available_date: null, source_freshness_status: "MISSING_SOURCE",
+      coverage: { status: "MISSING_SOURCE", first_loaded_date: null, last_loaded_date: null, source_freshness_status: "MISSING_SOURCE",
         blocking_reason: "No Shopee video-grain source is wired into the approved mart layer.", source: null },
       note: "Video-grain performance is only proven for TIKTOK this phase.",
     };
@@ -761,7 +761,7 @@ export async function getAffiliatePerformance(
   if (platform !== "SHOPEE") {
     return {
       rows: [], row_count: 0, platform,
-      coverage: { status: "MISSING_SOURCE", earliest_available_date: null, latest_available_date: null, source_freshness_status: "MISSING_SOURCE",
+      coverage: { status: "MISSING_SOURCE", first_loaded_date: null, last_loaded_date: null, source_freshness_status: "MISSING_SOURCE",
         blocking_reason: "No dedicated TikTok affiliate creator view exists; see the routing note.", source: null },
       note: "No dedicated TikTok affiliate creator/channel view exists in the approved mart " +
         "layer. TikTok's affiliate performance is exposed at the video/LIVE content grain " +

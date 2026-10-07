@@ -61,8 +61,8 @@ test("COGS status aggregation never uses max() on text (would rank READY above C
   assert.match(qs, /bool_or\(availability_status = 'COGS_INCOMPLETE'\) FILTER \(WHERE metric_name = 'sellable_cogs'\)/);
 });
 
-test("P14-B2: freshness probe reads both MIN and MAX business_date; rangeFrom is a fixed mart literal", () => {
-  assert.match(qs, /to_char\(min\(business_date\), 'YYYY-MM-DD'\) AS earliest_available_date/);
+test("P14-B2/C: freshness probe reads both MIN and MAX business_date; rangeFrom is a fixed mart literal", () => {
+  assert.match(qs, /to_char\(min\(business_date\), 'YYYY-MM-DD'\) AS first_loaded_date/);
   assert.match(qs, /to_char\(c\.date_from, 'YYYY-MM-DD'\) AS coverage_date_from/);
   const calls = [...qs.matchAll(/fetchFreshness\(env, log, "\w+",\s*("[^"]*"|\S+)/g)].map((m) => m[1]);
   assert.ok(calls.length >= 5, `found ${calls.length} fetchFreshness calls`);

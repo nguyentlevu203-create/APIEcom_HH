@@ -179,3 +179,29 @@ def test_shopee_rows_identical(pg):
     old, new = _row(pg, "ceo_053", SHOPEE_DAY, "SHOPEE"), _row(pg, "ceo_066", SHOPEE_DAY, "SHOPEE")
     assert old == new
     assert new["fixed_fee"] == -300 and new["payment_fee"] == -90
+
+
+def test_apply_then_rollback_restores_053_exactly(pg):
+    """P14-C — the real release sequence on the production view name:
+    053 (current) -> 066 (CREATE OR REPLACE must accept it: same 74 columns)
+    -> 053 again (rollback). Definition, rows and the hh_ai_reader grant
+    must come back exactly."""
+    pg.execute("DO $$ BEGIN CREATE ROLE hh_ai_reader; EXCEPTION WHEN duplicate_object THEN NULL; END $$")
+    pg.execute(_body(V053))
+    pg.execute("GRANT SELECT ON mart.v_ceo_ecom_daily TO hh_ai_reader")
+
+    def state():
+        pg.execute("SELECT pg_get_viewdef('mart.v_ceo_ecom_daily'::regclass, true)")
+        viewdef = pg.fetchone()[0]
+        pg.execute("SELECT * FROM mart.v_ceo_ecom_daily ORDER BY business_date, channel")
+        rows = pg.fetchall()
+        pg.execute("SELECT has_table_privilege('hh_ai_reader', 'mart.v_ceo_ecom_daily', 'SELECT')")
+        return viewdef, rows, pg.fetchone()[0]
+
+    before = state()
+    pg.execute(_body(V066))
+    applied = state()
+    assert applied[0] != before[0] and applied[2] is True
+    assert _row(pg, "v_ceo_ecom_daily", LAG, "TIKTOK")["fixed_fee"] is None
+    pg.execute(_body(V053))
+    assert state() == before
