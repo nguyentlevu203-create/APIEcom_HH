@@ -50,6 +50,7 @@ CADENCE_MINUTES = {
     ("TIKTOK", "product_analytics"): 60,
     ("TIKTOK", "live"): 60,
     ("TIKTOK", "shop_traffic"): 60,
+    ("TIKTOK", "ads"): 60,  # P15 — TikTok API for Business (GMV Max + auction ads cost)
 }
 
 

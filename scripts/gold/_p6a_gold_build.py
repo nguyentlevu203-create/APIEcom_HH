@@ -49,7 +49,7 @@ METRIC_DEFS = {
     "other_settlement_fees": ("Any other settlement deduction not covered above", "core.fact_settlement", "not separable from fee_and_tax_amount", "business_date, channel, shop_id"),
     "settlement_fee_and_tax_total": ("Combined fee+tax deducted at settlement (TikTok escrow field, not decomposable further)", "core.fact_settlement", "sum(fee_and_tax_amount) WHERE settlement_type='MATCHED'", "business_date, channel, shop_id"),
     "settlement_amount_estimated": ("Blended settlement/escrow total as currently reported (Shopee: escrow estimate; TikTok: MATCHED net settlement)", "core.fact_settlement", "sum(settlement_amount)", "business_date, channel, shop_id"),
-    "ads_spend": ("Paid ads spend (Shopee CPC ads API; TikTok has no ads collector built)", "core.fact_ads_daily", "sum(spend)", "business_date, channel, shop_id"),
+    "ads_spend": ("Paid ads spend (Shopee CPC ads API; TikTok GMV Max via TikTok API for Business, P15)", "core.fact_ads_daily", "sum(spend)", "business_date, channel, shop_id"),
     "affiliate_commission_estimated": ("Estimated affiliate/creator commission, before settlement", "core.fact_affiliate_daily", "sum(estimated_commission)", "business_date, channel, shop_id"),
     "affiliate_commission_settled": ("Affiliate commission that has actually settled (final)", "core.fact_affiliate_daily", "sum(settled_commission) WHERE settlement_status='SETTLED'/'INELIGIBLE' only (no pending rows that day)", "business_date, channel, shop_id"),
     "inventory_units_on_hand": ("Units on hand across SKUs, single point-in-time snapshot", "core.fact_inventory_snapshot", "sum(qty_on_hand)", "business_date, channel, shop_id"),
@@ -122,6 +122,27 @@ def main():
     cols = ["impressions", "clicks", "spend", "orders_broad", "gmv_broad", "orders_direct", "gmv_direct"]
     shopee_ads_detail = {row[0]: dict(zip(cols, row[1:])) for row in cur.fetchall()}
     shopee_ads_agg = {bd: v["spend"] for bd, v in shopee_ads_detail.items()}
+
+    # P15 — TikTok ads cost (TikTok API for Business). Only GMV_MAX rows
+    # (store == the pipeline's TikTok shop) are shop-attributed ads_spend;
+    # AUCTION rows have no store link and stay out of ads_spend until HH
+    # approves an allocation rule. A date is READY only when the collector
+    # wrote its COVERAGE marker for it — zero GMV_MAX rows on a covered
+    # date is a real 0, an uncovered date stays MISSING (never invented).
+    cur.execute(
+        """
+        SELECT business_date,
+            bool_or(attribution_basis = 'COVERAGE') AS covered,
+            sum(spend) FILTER (WHERE attribution_basis = 'GMV_MAX') AS spend,
+            sum(orders) FILTER (WHERE attribution_basis = 'GMV_MAX') AS orders,
+            sum(gmv) FILTER (WHERE attribution_basis = 'GMV_MAX') AS gmv
+        FROM core.fact_ads_daily WHERE channel='TIKTOK' GROUP BY 1;
+        """
+    )
+    tiktok_ads_detail = {
+        bd: {"covered": cov, "spend": sp or Decimal(0), "orders": o or 0, "gmv": g or Decimal(0)}
+        for bd, cov, sp, o, g in cur.fetchall() if cov
+    }
 
     cur.execute(
         "SELECT business_date, sum(estimated_commission), sum(settled_commission), "
@@ -284,7 +305,15 @@ def main():
             emit(bd, channel, "ads_orders_direct", ads.get("orders_direct"), ready)
             emit(bd, channel, "ads_gmv_direct", ads.get("gmv_direct"), ready)
         else:
-            emit(bd, channel, "ads_spend", None, STATUS["SEP_API"])
+            ads = tiktok_ads_detail.get(bd)
+            if ads is None:
+                emit(bd, channel, "ads_spend", None, STATUS["MISSING"])
+            else:
+                # GMV Max attributed orders/revenue map to the "broad"
+                # (all attributed shop sales) columns; no DIRECT split exists.
+                emit(bd, channel, "ads_spend", ads["spend"], STATUS["READY"])
+                emit(bd, channel, "ads_orders_broad", ads["orders"], STATUS["READY"])
+                emit(bd, channel, "ads_gmv_broad", ads["gmv"], STATUS["READY"])
 
         # affiliate
         if channel == "SHOPEE":

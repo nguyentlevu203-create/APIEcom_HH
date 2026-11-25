@@ -1010,11 +1010,53 @@ def run_product_inventory(cur, etl_run_id, shop_id, window_start, window_end, lo
     return {"dim_product": product_ctr.as_dict(), "fact_inventory_snapshot": inv_ctr.as_dict(), "status": status}
 
 
+# ---------------------------------------------------------------------
+# P15 — TikTok ads cost (TikTok API for Business: GMV Max + auction ads)
+# ---------------------------------------------------------------------
+# Ads cost for a day keeps moving for ~1-2 days (late attribution, ROI
+# protection compensation), so every run re-pulls a short trailing
+# window and upserts. A catch-up after an outage is capped so one call
+# stays far inside the 600 s worker timeout; the rest follows next run.
+TIKTOK_ADS_TRAILING_DAYS = 3
+TIKTOK_ADS_MAX_DAYS_PER_CALL = 31
+
+TIKTOK_BUSINESS_DIR = PILOT_DIR.parent.parent / "tiktok_business"
+
+
+def _tiktok_ads_days(window_start, window_end, now, target_date=None):
+    """Pure — inclusive [start, end] VN dates to pull."""
+    if target_date:
+        return target_date, target_date
+    end = min(ic.vn_date(window_end), ic.vn_date(now))
+    start = min(ic.vn_date(window_start), end) - timedelta(days=TIKTOK_ADS_TRAILING_DAYS - 1)
+    if (end - start).days + 1 > TIKTOK_ADS_MAX_DAYS_PER_CALL:
+        end = start + timedelta(days=TIKTOK_ADS_MAX_DAYS_PER_CALL - 1)
+    return start, end
+
+
+def run_ads(cur, etl_run_id, shop_id, window_start, window_end, log, target_date=None) -> dict:
+    if str(TIKTOK_BUSINESS_DIR) not in sys.path:
+        sys.path.insert(0, str(TIKTOK_BUSINESS_DIR))
+    import ads_collector  # noqa: E402 — separate app/credentials (TikTok API for Business)
+
+    start, end = _tiktok_ads_days(window_start, window_end, ic.now_utc(), target_date)
+    creds = ads_collector.load_credentials()
+    get = ads_collector.make_getter(creds, log)
+    rows = ads_collector.collect(get, creds, str(shop_id), start, end, log)
+    result = {"fact_ads_daily": ads_collector.upsert_rows(cur, etl_run_id, rows, ic.Counters()),
+              "days": [start.isoformat(), end.isoformat()]}
+    if not target_date and end < min(ic.vn_date(window_end), ic.vn_date(ic.now_utc())):
+        # capped catch-up: advance sync_state only through what was written
+        tz7 = ic.VN_TZ
+        result["_effective_sync_end"] = datetime(end.year, end.month, end.day, 23, 59, 59, tzinfo=tz7)
+    return result
+
+
 HANDLERS = {
     "orders": run_orders, "returns": run_returns, "finance": run_finance,
     "affiliate": run_affiliate, "product_analytics": run_product_analytics,
     "live": run_live, "product_inventory": run_product_inventory,
-    "shop_traffic": run_shop_traffic,
+    "shop_traffic": run_shop_traffic, "ads": run_ads,
 }
 
 
@@ -1270,7 +1312,10 @@ def main() -> int:
         phase = _phase_emitter(domain, etl_run_id)
         result = HANDLERS[domain](cur, etl_run_id, shop_id, window_start, window_end, log)
         phase("handler_complete")
-        ic.upsert_sync_state(cur, "TIKTOK", domain, shop_id, window_end, ic.vn_date(window_end), "success")
+        # P15 — only TIKTOK/ads (capped catch-up) ever sets this key.
+        sync_end = result.pop("_effective_sync_end", None) if isinstance(result, dict) else None
+        sync_end = sync_end or window_end
+        ic.upsert_sync_state(cur, "TIKTOK", domain, shop_id, sync_end, ic.vn_date(sync_end), "success")
         phase("sync_state_updated")
         conn.commit()
         phase("db_commit_complete")

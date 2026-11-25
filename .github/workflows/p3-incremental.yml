@@ -46,6 +46,8 @@
 #   TIKTOK_APP_SECRET
 #   TIKTOK_TOKENS_JSON        (full JSON content of tokens.json)
 #   TIKTOK_SHOP_INFO_JSON     (full JSON content of shop_info.json)
+#   TIKTOK_BUSINESS_AUTH_JSON (P15 — TikTok API for Business app_id/secret/
+#                              access_token for the TIKTOK/ads domain)
 #
 # Cron timezone note (verified, not assumed): GitHub Actions `schedule`
 # events run in UTC ONLY. Business cadence (from the disabled macOS
@@ -196,6 +198,10 @@ jobs:
           # containing access_token/refresh_token/*_expire_at together, so
           # a refresh mid-run never leaves a partially-updated legacy set.
           SHOPEE_TOKEN_STATE_JSON: ${{ secrets.SHOPEE_TOKEN_STATE_JSON }}
+          # P15 — TikTok API for Business (ads cost, TIKTOK/ads domain):
+          # {"app_id","secret","access_token"}. Long-lived advertiser token,
+          # no rotation/write-back needed. See integrations/tiktok_business/.
+          TIKTOK_BUSINESS_AUTH_JSON: ${{ secrets.TIKTOK_BUSINESS_AUTH_JSON }}
           # AMS (affiliate) app — a SEPARATE Shopee app (id 2044772) from
           # the main one above, with its own static credentials and its
           # own rotating-state bundle (P11-BIS). Never mixed with the

@@ -66,7 +66,7 @@ SHOPEE_WORKER = ROOT / "integrations" / "shopee" / "pilot_reporting" / "incr_wor
 TIKTOK_WORKER = ROOT / "integrations" / "tiktok_shop" / "pilot_reporting" / "incr_worker.py"
 
 SHOPEE_ONLY_DOMAINS = {"orders", "returns", "finance", "ads", "product_inventory", "affiliate_ams", "account_health"}
-TIKTOK_ONLY_DOMAINS = {"orders", "returns", "finance", "affiliate", "product_analytics", "live", "product_inventory", "shop_traffic"}
+TIKTOK_ONLY_DOMAINS = {"orders", "returns", "finance", "affiliate", "product_analytics", "live", "product_inventory", "shop_traffic", "ads"}
 
 WORKER_BY_SYSTEM = {"SHOPEE": SHOPEE_WORKER, "TIKTOK": TIKTOK_WORKER}
 

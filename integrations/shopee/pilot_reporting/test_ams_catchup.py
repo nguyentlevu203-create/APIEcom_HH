@@ -206,3 +206,67 @@ def test_partial_completion_returns_end_of_last_completed_day():
 
 def test_empty_days_returns_none():
     assert _ams_effective_sync_end([], None) is None
+
+
+# =====================================================================
+# P15 — per-call time budget (backlog larger than one worker timeout)
+# =====================================================================
+
+class _FakeClock:
+    """Each process_day call advances the clock by `per_day` seconds."""
+
+    def __init__(self, per_day):
+        self.now = 0.0
+        self.per_day = per_day
+
+    def __call__(self):
+        return self.now
+
+
+def _budgeted(days, per_day, budget):
+    clock = _FakeClock(per_day)
+    calls = []
+
+    def process_day(d):
+        calls.append(d)
+        clock.now += per_day
+
+    result = _run_ams_catchup(days, process_day, _fake_log, budget_seconds=budget, clock=clock)
+    return result, calls
+
+
+def test_budget_stops_between_days_and_keeps_progress():
+    days = [date(2026, 10, 20) + timedelta(days=i) for i in range(35)]
+    result, calls = _budgeted(days, per_day=50, budget=360)
+    # days start at t=0,50,...,350 (<360) -> 8 days done, 9th not started
+    assert calls == days[:8]
+    assert result == days[7]
+    # sync_state advances only through the last completed day, not window_end
+    assert _ams_effective_sync_end(days, result) == datetime(2026, 10, 27, 16, 59, 59, tzinfo=UTC)
+
+
+def test_budget_always_attempts_at_least_one_day():
+    days = [date(2026, 10, 20), date(2026, 10, 21)]
+    result, calls = _budgeted(days, per_day=1000, budget=360)
+    assert calls == [date(2026, 10, 20)]
+    assert result == date(2026, 10, 20)
+
+
+def test_budget_not_reached_processes_whole_window():
+    days = [date(2026, 11, 20), date(2026, 11, 21), date(2026, 11, 22)]
+    result, calls = _budgeted(days, per_day=20, budget=360)
+    assert calls == days
+    assert _ams_effective_sync_end(days, result) is None
+
+
+def test_no_budget_keeps_previous_unbounded_behavior():
+    days = [date(2026, 10, 20) + timedelta(days=i) for i in range(35)]
+    result, calls = _budgeted(days, per_day=50, budget=None)
+    assert calls == days
+
+
+def test_budget_stop_is_not_an_error_even_after_partial_progress():
+    days = [date(2026, 10, 20) + timedelta(days=i) for i in range(10)]
+    result, calls = _budgeted(days, per_day=200, budget=360)
+    assert calls == days[:2]  # t=0 and t=200 start; t=400 >= 360 stops
+    assert result == days[1]
