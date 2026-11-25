@@ -546,7 +546,18 @@ def _ams_compute_catchup_days(window_start, window_end, now, target_date=None):
     return days
 
 
-def _run_ams_catchup(days, process_day, log):
+# P15 — per-call time budget for the AMS catch-up. Proven live
+# 2026-11-20..25: sync_state stuck at 2026-10-20 (backlog ~35 days); one
+# AMS day costs ~15-55 s, so every incremental call was killed by the
+# 600 s DOMAIN_WORKER_TIMEOUT before its single commit — zero progress,
+# RED verdict every run. With a budget the call stops cleanly between
+# days, commits what it finished and advances sync_state through the
+# last completed day (same partial path as "date not ready"), so the
+# backlog drains over a few runs instead of never.
+AMS_CATCHUP_TIME_BUDGET_SECONDS = 360
+
+
+def _run_ams_catchup(days, process_day, log, budget_seconds=None, clock=time.monotonic):
     """Pure control flow (process_day is injected — no DB/HTTP here, so
     this is fully unit-testable). Processes days in chronological order.
     On a "date not ready" error: stops (later days would fail the same
@@ -558,10 +569,21 @@ def _run_ams_catchup(days, process_day, log):
     because the very first day is not published yet — no artificial
     sync_state advancement over a call that made no real progress.
 
+    budget_seconds (P15): when set, no NEW day is started once that many
+    seconds have elapsed since the call began; at least one day is always
+    attempted. Stopping on the budget is normal partial progress, never an
+    error.
+
     Returns the last successfully completed date."""
     last_completed_date = None
     stop_error = None
+    started = clock()
     for d in days:
+        if budget_seconds is not None and last_completed_date is not None \
+                and clock() - started >= budget_seconds:
+            log(f"AMS catch-up time budget {budget_seconds}s reached — stopping before {d.isoformat()}, "
+                f"keeping {days.index(d)} day(s) written this run; the rest continues next cycle")
+            break
         try:
             process_day(d)
         except RuntimeError as e:
@@ -839,7 +861,11 @@ def run_affiliate_ams(cur, etl_run_id, shop_id, window_start, window_end, log, t
         ):
             upsert_perf("PRODUCT", None, None, None, D(row.get("item_id")), row.get("item_name"), row)
 
-    last_completed_date = _run_ams_catchup(days, process_day, log)
+    # Reconciliation (target_date) is always exactly one day — no budget needed.
+    last_completed_date = _run_ams_catchup(
+        days, process_day, log,
+        budget_seconds=None if target_date else AMS_CATCHUP_TIME_BUDGET_SECONDS,
+    )
 
     result = {"affiliate_ams_conversion": conv_ctr.as_dict(), "affiliate_ams_performance": perf_ctr.as_dict()}
     effective_sync_end = _ams_effective_sync_end(days, last_completed_date)

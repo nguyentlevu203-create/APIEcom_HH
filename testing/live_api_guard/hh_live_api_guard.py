@@ -24,6 +24,7 @@ OPT_IN_ENV = "HH_ALLOW_LIVE_API_TESTS"
 BLOCKED_SUFFIXES = (
     "shopeemobile.com", "shopee.com", "shopee.vn", "shopee.co.id", "shopee.sg",
     "tiktokglobalshop.com", "tiktok-shops.com", "tiktokshop.com", "tiktokshops.com",
+    "business-api.tiktok.com", "sandbox-ads.tiktok.com",  # P15 — TikTok API for Business
     "api.github.com", "neon.tech",
 )
 
