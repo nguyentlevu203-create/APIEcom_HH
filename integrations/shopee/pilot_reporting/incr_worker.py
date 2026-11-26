@@ -338,7 +338,11 @@ def run_finance(cur, etl_run_id, shop_id, window_start, window_end, log) -> dict
                 detail.get("shopee_shipping_rebate"), detail.get("buyer_paid_shipping_fee"),
                 detail.get("order_ams_commission_fee"), detail.get("ads_escrow_top_up_fee_or_technical_support_fee"),
                 order_income_raw, buyer_payment_info_raw,
-                "SHOPEE", e.get("request_id"), "/api/v2/payment/get_escrow_detail", shop_id, etl_run_id,
+                # An escrow error response can omit request_id (proven live
+                # 2026-11-26, order 261116FCG5445J) — source_record_id is
+                # NOT NULL, so fall back to the order_sn instead of failing
+                # the whole finance call.
+                "SHOPEE", e.get("request_id") or sn, "/api/v2/payment/get_escrow_detail", shop_id, etl_run_id,
             ),
         )
         ctr.record(cur.fetchone()[0])

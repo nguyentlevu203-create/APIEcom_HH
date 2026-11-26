@@ -452,47 +452,9 @@ def run_returns(cur, etl_run_id, shop_id, window_start, window_end, log) -> dict
 # est_fee_tax_amount + est_shipping_cost_amount, fees negative). 20 pages
 # x 50 = the 1,000 most recent unsettled orders (was 10 pages, status only).
 UNSETTLED_MAX_PAGES = 20
-EMPTY_ESTIMATE = {
-    "est_settlement_amount": None, "est_revenue_amount": None, "est_fee_tax_amount": None,
-    "est_shipping_cost_amount": None, "est_unsettled_reason": None,
-}
-
-
-def unsettled_estimate(row) -> dict:
-    """Pure: map one unsettled-list row to the est_* columns. Missing /
-    blank fields stay None (canonical explicit-zero-vs-missing contract)."""
-    if not row:
-        return dict(EMPTY_ESTIMATE)
-    return {
-        "est_settlement_amount": ic.dec(row.get("est_settlement_amount")),
-        "est_revenue_amount": ic.dec(row.get("est_revenue_amount")),
-        "est_fee_tax_amount": ic.dec(row.get("est_fee_tax_amount")),
-        "est_shipping_cost_amount": ic.dec(row.get("est_shipping_cost_amount")),
-        "est_unsettled_reason": row.get("unsettled_reason") or None,
-    }
-
-
-def refresh_unsettled_estimates(cur, shop_id, unsettled_by_order, skip=frozenset()) -> int:
-    refreshed = 0
-    for oid, row in unsettled_by_order.items():
-        if oid in skip:
-            continue
-        est = unsettled_estimate(row)
-        if est["est_settlement_amount"] is None:
-            continue
-        cur.execute(
-            """
-            UPDATE core.fact_settlement SET
-                est_settlement_amount = %s, est_revenue_amount = %s, est_fee_tax_amount = %s,
-                est_shipping_cost_amount = %s, est_unsettled_reason = %s, est_updated_at = now()
-            WHERE channel = 'TIKTOK' AND shop_id = %s AND settlement_id = %s
-              AND settlement_type IS DISTINCT FROM 'MATCHED';
-            """,
-            (est["est_settlement_amount"], est["est_revenue_amount"], est["est_fee_tax_amount"],
-             est["est_shipping_cost_amount"], est["est_unsettled_reason"], shop_id, oid),
-        )
-        refreshed += cur.rowcount
-    return refreshed
+from unsettled_estimate import (  # noqa: E402  (P16, dependency-free helpers)
+    EMPTY_ESTIMATE, refresh_unsettled_estimates, unsettled_estimate,
+)
 
 
 def run_finance(cur, etl_run_id, shop_id, window_start, window_end, log) -> dict:
