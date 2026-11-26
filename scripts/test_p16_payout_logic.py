@@ -11,6 +11,24 @@ sys.path.insert(0, str(ROOT / "scripts" / "gold"))
 sys.path.insert(0, str(ROOT / "integrations" / "tiktok_shop" / "pilot_reporting"))
 sys.path.insert(0, str(ROOT / "pipelines"))
 
+import importlib.util  # noqa: E402
+
+
+def _tiktok_worker():
+    """Load the dependency-free TikTok helper module by path under a unique
+    name (shopee/ and tiktok_shop/ both have incr_worker.py / config.py, so
+    bare imports depend on test ordering)."""
+    name = "p16_tiktok_unsettled_estimate"
+    if name in sys.modules:
+        return sys.modules[name]
+    path = ROOT / "integrations" / "tiktok_shop" / "pilot_reporting" / "unsettled_estimate.py"
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
 from _p16_payout_logic import (  # noqa: E402
     ACTUAL, ESTIMATE, MISSING, NO_PAYOUT_EXPECTED, aggregate, classify_order, payout_status,
 )
@@ -120,7 +138,7 @@ def test_build_rows_groups_by_order_business_date():
 # --- TikTok worker estimate mapping -----------------------------------------
 
 def test_unsettled_estimate_maps_platform_fields():
-    from incr_worker import unsettled_estimate
+    unsettled_estimate = _tiktok_worker().unsettled_estimate
     est = unsettled_estimate({
         "order_id": "586012397469927110", "est_settlement_amount": "259293",
         "est_revenue_amount": "344000", "est_fee_tax_amount": "-84707",
@@ -134,7 +152,7 @@ def test_unsettled_estimate_maps_platform_fields():
 
 
 def test_unsettled_estimate_missing_row_or_blank_is_none():
-    from incr_worker import unsettled_estimate
+    unsettled_estimate = _tiktok_worker().unsettled_estimate
     assert unsettled_estimate(None)["est_settlement_amount"] is None
     assert unsettled_estimate({"est_settlement_amount": ""})["est_settlement_amount"] is None
 
@@ -148,7 +166,7 @@ class _FakeCur:
 
 
 def test_refresh_only_updates_non_matched_and_skips_window_orders():
-    from incr_worker import refresh_unsettled_estimates
+    refresh_unsettled_estimates = _tiktok_worker().refresh_unsettled_estimates
     cur = _FakeCur()
     n = refresh_unsettled_estimates(cur, "shop", {
         "a": {"est_settlement_amount": "10"},
