@@ -447,6 +447,54 @@ def run_returns(cur, etl_run_id, shop_id, window_start, window_end, log) -> dict
     return {"return": ctr.as_dict(), "status": status}
 
 
+# P16 — TikTok /finance/202507/orders/unsettled carries the platform's own
+# payout estimate per order (est_settlement_amount = est_revenue_amount +
+# est_fee_tax_amount + est_shipping_cost_amount, fees negative). 20 pages
+# x 50 = the 1,000 most recent unsettled orders (was 10 pages, status only).
+UNSETTLED_MAX_PAGES = 20
+EMPTY_ESTIMATE = {
+    "est_settlement_amount": None, "est_revenue_amount": None, "est_fee_tax_amount": None,
+    "est_shipping_cost_amount": None, "est_unsettled_reason": None,
+}
+
+
+def unsettled_estimate(row) -> dict:
+    """Pure: map one unsettled-list row to the est_* columns. Missing /
+    blank fields stay None (canonical explicit-zero-vs-missing contract)."""
+    if not row:
+        return dict(EMPTY_ESTIMATE)
+    return {
+        "est_settlement_amount": ic.dec(row.get("est_settlement_amount")),
+        "est_revenue_amount": ic.dec(row.get("est_revenue_amount")),
+        "est_fee_tax_amount": ic.dec(row.get("est_fee_tax_amount")),
+        "est_shipping_cost_amount": ic.dec(row.get("est_shipping_cost_amount")),
+        "est_unsettled_reason": row.get("unsettled_reason") or None,
+    }
+
+
+def refresh_unsettled_estimates(cur, shop_id, unsettled_by_order, skip=frozenset()) -> int:
+    refreshed = 0
+    for oid, row in unsettled_by_order.items():
+        if oid in skip:
+            continue
+        est = unsettled_estimate(row)
+        if est["est_settlement_amount"] is None:
+            continue
+        cur.execute(
+            """
+            UPDATE core.fact_settlement SET
+                est_settlement_amount = %s, est_revenue_amount = %s, est_fee_tax_amount = %s,
+                est_shipping_cost_amount = %s, est_unsettled_reason = %s, est_updated_at = now()
+            WHERE channel = 'TIKTOK' AND shop_id = %s AND settlement_id = %s
+              AND settlement_type IS DISTINCT FROM 'MATCHED';
+            """,
+            (est["est_settlement_amount"], est["est_revenue_amount"], est["est_fee_tax_amount"],
+             est["est_shipping_cost_amount"], est["est_unsettled_reason"], shop_id, oid),
+        )
+        refreshed += cur.rowcount
+    return refreshed
+
+
 def run_finance(cur, etl_run_id, shop_id, window_start, window_end, log) -> dict:
     session = pilot_common.bootstrap_session()
     order_rows, order_status = tt_collect.paginate(
@@ -463,7 +511,7 @@ def run_finance(cur, etl_run_id, shop_id, window_start, window_end, log) -> dict
     unsettled_rows, unsettled_status = tt_collect.paginate(
         _Log(log), session, "finance_unsettled", _label(), "finance_unsettled_incr",
         query_base={"page_size": "50", "sort_field": "order_create_time", "sort_order": "DESC"},
-        max_pages=10,
+        max_pages=UNSETTLED_MAX_PAGES,
     )
     tiktok_check(unsettled_status, "finance_unsettled")
     unsettled_by_order = {r.get("order_id"): r for r in unsettled_rows if r.get("order_id")}
@@ -651,6 +699,9 @@ def run_finance(cur, etl_run_id, shop_id, window_start, window_end, log) -> dict
         else:
             status = "NOT_SETTLED_YET" if oid in unsettled_by_order else "UNKNOWN"
             settlement_amount = revenue = fee = ship = currency = None
+        # P16 — TikTok's own estimate for a not-yet-settled order (None
+        # for MATCHED, or when the order is not in the unsettled list).
+        est = unsettled_estimate(unsettled_by_order.get(oid)) if status != "MATCHED" else EMPTY_ESTIMATE
 
         cur.execute(
             """
@@ -658,26 +709,46 @@ def run_finance(cur, etl_run_id, shop_id, window_start, window_end, log) -> dict
                 channel, shop_id, order_id, settlement_id, settlement_amount,
                 settlement_type, settlement_time, business_date,
                 currency, revenue_amount, fee_and_tax_amount, shipping_cost_amount,
+                est_settlement_amount, est_revenue_amount, est_fee_tax_amount, est_shipping_cost_amount,
+                est_unsettled_reason, est_updated_at,
                 source_system, source_record_id, source_endpoint, source_shop_id, etl_run_id
-            ) VALUES (%s,%s,%s,%s,%s,%s,NULL,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+            ) VALUES (%s,%s,%s,%s,%s,%s,NULL,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                      CASE WHEN %s IS NULL THEN NULL ELSE now() END,%s,%s,%s,%s,%s)
             ON CONFLICT (channel, shop_id, settlement_id) DO UPDATE SET
                 settlement_amount = EXCLUDED.settlement_amount, settlement_type = EXCLUDED.settlement_type,
                 currency = EXCLUDED.currency, revenue_amount = EXCLUDED.revenue_amount,
                 fee_and_tax_amount = EXCLUDED.fee_and_tax_amount, shipping_cost_amount = EXCLUDED.shipping_cost_amount,
+                -- P16: keep the last platform estimate for audit once the
+                -- order settles (MATCHED passes NULL estimates).
+                est_settlement_amount = COALESCE(EXCLUDED.est_settlement_amount, core.fact_settlement.est_settlement_amount),
+                est_revenue_amount = COALESCE(EXCLUDED.est_revenue_amount, core.fact_settlement.est_revenue_amount),
+                est_fee_tax_amount = COALESCE(EXCLUDED.est_fee_tax_amount, core.fact_settlement.est_fee_tax_amount),
+                est_shipping_cost_amount = COALESCE(EXCLUDED.est_shipping_cost_amount, core.fact_settlement.est_shipping_cost_amount),
+                est_unsettled_reason = COALESCE(EXCLUDED.est_unsettled_reason, core.fact_settlement.est_unsettled_reason),
+                est_updated_at = COALESCE(EXCLUDED.est_updated_at, core.fact_settlement.est_updated_at),
                 etl_run_id = EXCLUDED.etl_run_id
             RETURNING (xmax = 0) AS inserted;
             """,
             (
                 "TIKTOK", shop_id, oid, oid, settlement_amount, status, ic.vn_date(window_end),
                 currency, revenue, fee, ship,
+                est["est_settlement_amount"], est["est_revenue_amount"], est["est_fee_tax_amount"],
+                est["est_shipping_cost_amount"], est["est_unsettled_reason"], est["est_settlement_amount"],
                 "TIKTOK", oid, "/finance/202501/orders/{order_id}/statement_transactions", shop_id, etl_run_id,
             ),
         )
         ctr.record(cur.fetchone()[0])
         time.sleep(0.12)
+
+    # P16 self-backfill — refresh TikTok's estimate on every EXISTING
+    # not-yet-settled row present in the unsettled list, including orders
+    # outside this run's update window. Never creates rows, never touches
+    # MATCHED rows. No extra API calls (the list was fetched above).
+    est_refreshed = refresh_unsettled_estimates(cur, shop_id, unsettled_by_order, skip=set(order_ids))
     return {
         "settlement": ctr.as_dict(), "settlement_sku_fee": sku_fee_ctr.as_dict(),
         "settlement_sku_transaction": sku_tx_ctr.as_dict(),
+        "unsettled_estimate_refreshed": est_refreshed,
     }
 
 

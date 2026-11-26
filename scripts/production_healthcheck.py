@@ -175,9 +175,29 @@ def check_database(findings: list[tuple[str, str, str]]):
     cur.execute(
         "SELECT count(*) FROM mart.v_ceo_ecom_daily WHERE channel='TIKTOK' "
         "AND cm1 IS NOT NULL AND affiliate_fee IS NOT NULL AND cm2_known IS NOT NULL "
-        "AND abs(cm2_known - (cm1 - affiliate_fee)) > 0.01;"
+        # P15 — mirrors scripts/gold/_p6b4_tiktok_cm2.py: ads are subtracted
+        # only on dates where ads_spend is READY; otherwise cm1 - affiliate_fee.
+        "AND abs(cm2_known - (cm1 - affiliate_fee - CASE WHEN ads_spend_status = 'READY' "
+        "AND ads_spend IS NOT NULL THEN ads_spend ELSE 0 END)) > 0.01;"
     )
     tiktok_cm2_mismatch = cur.fetchone()[0]
+
+    # 7b. P16 payout identity: payout = payout_actual + payout_estimated
+    # (mirrors scripts/gold/_p16_payout_logic.py::aggregate). Skipped until
+    # sql/067 has added the columns to the view.
+    cur.execute(
+        "SELECT count(*) FROM information_schema.columns "
+        "WHERE table_schema='mart' AND table_name='v_ceo_ecom_daily' AND column_name='payout';"
+    )
+    if cur.fetchone()[0]:
+        cur.execute(
+            "SELECT count(*) FROM mart.v_ceo_ecom_daily WHERE payout IS NOT NULL "
+            "AND abs(payout - (COALESCE(payout_actual, 0) + COALESCE(payout_estimated, 0))) > 0.01;"
+        )
+        payout_mismatch = cur.fetchone()[0]
+        findings.append(("RED" if payout_mismatch else "GREEN", "PAYOUT_FORMULA_MISMATCHES", f"{payout_mismatch}"))
+    else:
+        findings.append(("YELLOW", "PAYOUT_FORMULA_MISMATCHES", "sql/067 not applied — payout columns absent"))
     findings.append(("RED" if shopee_cm2_mismatch else "GREEN", "SHOPEE_CM2_FORMULA_MISMATCHES", f"{shopee_cm2_mismatch}"))
     findings.append(("RED" if tiktok_cm2_mismatch else "GREEN", "TIKTOK_CM2_FORMULA_MISMATCHES", f"{tiktok_cm2_mismatch}"))
 

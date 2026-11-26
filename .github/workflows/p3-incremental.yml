@@ -130,7 +130,11 @@ jobs:
     # 600s; TIMEOUT live in run 35948968552). Worst case: 3600 + 6 x 600
     # + 1200 + 6000 + 120 = 14520s, +300s margin = 14820s (247 min).
     # 250 min = 15000s.
-    timeout-minutes: 250
+    #
+    # P16 (2026-11-26): 8th Gold script (_p16_payout_gold.py, 600s cap).
+    # Worst case: 3600 + 7 x 600 + 1200 + 6000 + 120 = 15120s, +300s
+    # margin = 15420s (257 min). 260 min = 15600s.
+    timeout-minutes: 260
     env:
       TZ: UTC
     steps:
