@@ -167,6 +167,7 @@ GOLD_CHAIN = [
     ("BASE_GOLD+PNL: Shopee affiliate volume + commission (order-level precedence)", "_p6c4_affiliate_gold.py"),
     ("PNL_ENRICHMENT: Shopee cm2_known/cm2", "_p6c5_shopee_cm2.py"),
     ("PNL_ENRICHMENT: TikTok cm2_known/cm2", "_p6b4_tiktok_cm2.py"),
+    ("PNL_ENRICHMENT: payout (tiền về) platform estimate -> actual", "_p16_payout_gold.py"),
 ]
 
 

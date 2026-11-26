@@ -48,6 +48,7 @@ GOLD_CHAIN_ENTRIES = [
     "_p6c4_affiliate_gold.py",
     "_p6c5_shopee_cm2.py",
     "_p6b4_tiktok_cm2.py",
+    "_p16_payout_gold.py",
 ]
 
 # Transitive local imports (see the P11-QUATER report's dependency graph).
@@ -57,6 +58,7 @@ GOLD_TRANSITIVE_DEPS = [
     "_p5b_load.py",
     "_p5b_recompute.py",
     "_p6b1_finalize.py",
+    "_p16_payout_logic.py",  # P16 — pure payout rules
     "_p6b_pnl_build.py",
     "_p6c1_cogs_status.py",
 ]
@@ -142,6 +144,7 @@ def test_no_gold_chain_call_path_reads_the_keymap_file():
         "_p6a_gold_build.py", "_p8_5_operational_packaging.py",
         "_p6c1_shopee_pnl_extend.py", "_p6b3_pnl_extend.py",
         "_p6c4_affiliate_gold.py", "_p6c5_shopee_cm2.py", "_p6b4_tiktok_cm2.py",
+        "_p16_payout_gold.py", "_p16_payout_logic.py",
         "_p6b1_finalize.py", "_p6b_pnl_build.py", "_p6c1_cogs_status.py",
     ]
     for filename in disallowed_caller_files:

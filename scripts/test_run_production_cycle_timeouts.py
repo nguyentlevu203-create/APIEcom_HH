@@ -104,8 +104,8 @@ def test_p11_quinque_expected_stage_values():
     assert _int_constant(CYCLE_SRC, "GOLD_SCRIPT_TIMEOUT_SECONDS") == 600
     assert _int_constant(CYCLE_SRC, "RECONCILIATION_TIMEOUT_SECONDS") == 6000
     assert _int_constant(CYCLE_SRC, "HEALTHCHECK_TIMEOUT_SECONDS") == 120
-    assert _gold_chain_length(CYCLE_SRC) == 7
-    assert _job_timeout_minutes(WORKFLOW_SRC) == 250
+    assert _gold_chain_length(CYCLE_SRC) == 8
+    assert _job_timeout_minutes(WORKFLOW_SRC) == 260
     assert _gold_overrides(CYCLE_SRC) == {"_p6a_gold_build.py": 1200}
 
 
